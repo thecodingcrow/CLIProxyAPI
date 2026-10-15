@@ -228,6 +228,16 @@ func applyClaudeOAuthAxiosHeaders(req *http.Request) {
 	req.Close = true
 }
 
+// ControlPlaneStatusError is a non-2xx answer from an OAuth control-plane GET.
+type ControlPlaneStatusError struct {
+	Label      string
+	StatusCode int
+}
+
+func (e *ControlPlaneStatusError) Error() string {
+	return fmt.Sprintf("fetch Claude OAuth %s failed with status %d", e.Label, e.StatusCode)
+}
+
 // fetchOAuthControlPlaneJSON issues an Axios-shaped OAuth control-plane GET and
 // returns the decoded response body. label names the endpoint in error text.
 func (o *ClaudeAuth) fetchOAuthControlPlaneJSON(ctx context.Context, endpoint, accessToken, label string) ([]byte, error) {
@@ -273,7 +283,7 @@ func (o *ClaudeAuth) fetchOAuthControlPlaneJSONWithBeta(ctx context.Context, end
 		return nil, fmt.Errorf("read Claude OAuth %s response: %w", label, errRead)
 	}
 	if resp.StatusCode < http.StatusOK || resp.StatusCode >= http.StatusMultipleChoices {
-		return nil, fmt.Errorf("fetch Claude OAuth %s failed with status %d", label, resp.StatusCode)
+		return nil, &ControlPlaneStatusError{Label: label, StatusCode: resp.StatusCode}
 	}
 	return body, nil
 }
