@@ -26,6 +26,8 @@ const (
 	maxNodeKindsPerBucket = 8
 	otherNodeKind         = "other"
 	unknownName           = "unknown"
+	// Executor identifier prefix for openai-compatibility entries.
+	openAICompatibleProviderPrefix = "openai-compatible-"
 )
 
 // Key identifies one aggregated series.
@@ -243,6 +245,10 @@ func (a *Aggregator) Snapshot() Snapshot {
 // fromRecord resolves session and failure the same way the Redis usage queue does.
 func fromRecord(ctx context.Context, record coreusage.Record) (Key, string, Counters) {
 	provider := strings.ToLower(strings.TrimSpace(record.Provider))
+	// Compat executors report "openai-compatible-<name>"; the api-keys view groups them by compat name.
+	if compatName := strings.TrimPrefix(provider, openAICompatibleProviderPrefix); compatName != provider && compatName != "" {
+		provider = compatName
+	}
 	if provider == "" {
 		provider = unknownName
 	}

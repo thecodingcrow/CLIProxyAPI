@@ -146,6 +146,17 @@ func TestCachedSumsReadAndCreation(t *testing.T) {
 	}
 }
 
+func TestProviderMatchesAPIKeyGrouping(t *testing.T) {
+	agg := New(newClock().Now, 0)
+	agg.HandleUsage(context.Background(), record("openai-compatible-OpenRouter", "kimi", 1, 1))
+	agg.HandleUsage(context.Background(), record(" Claude ", "opus", 1, 1))
+	agg.HandleUsage(context.Background(), record("", "x", 1, 1))
+	snap := agg.Snapshot()
+	findRow(t, snap, "openrouter", "kimi", false)
+	findRow(t, snap, "claude", "opus", false)
+	findRow(t, snap, "unknown", "x", false)
+}
+
 func TestKeyCapEvictsLeastRecentlyActive(t *testing.T) {
 	clock := newClock()
 	agg := New(clock.Now, 2)
