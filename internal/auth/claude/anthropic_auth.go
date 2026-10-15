@@ -29,7 +29,11 @@ const (
 	ProfileURL      = "https://api.anthropic.com/api/oauth/profile"
 	// RolesURL is the claude_cli role endpoint the native client queries right
 	// after a successful token exchange, alongside the profile lookup.
-	RolesURL         = "https://api.anthropic.com/api/oauth/claude_cli/roles"
+	RolesURL = "https://api.anthropic.com/api/oauth/claude_cli/roles"
+	// UsageURL reports the plan limits (session, weekly, model-scoped weekly)
+	// of an OAuth account; it requires the UsageBeta header.
+	UsageURL         = "https://api.anthropic.com/api/oauth/usage"
+	UsageBeta        = "oauth-2025-04-20"
 	ClientID         = "9d1c250a-e61b-44d9-88ed-5944d1962f5e"
 	RedirectURI      = "http://localhost:54545/callback"
 	ClaudeOAuthScope = "user:profile user:inference user:sessions:claude_code user:mcp_servers user:file_upload"
@@ -227,6 +231,16 @@ func applyClaudeOAuthAxiosHeaders(req *http.Request) {
 // fetchOAuthControlPlaneJSON issues an Axios-shaped OAuth control-plane GET and
 // returns the decoded response body. label names the endpoint in error text.
 func (o *ClaudeAuth) fetchOAuthControlPlaneJSON(ctx context.Context, endpoint, accessToken, label string) ([]byte, error) {
+	return o.fetchOAuthControlPlaneJSONWithBeta(ctx, endpoint, accessToken, label, "")
+}
+
+// FetchOAuthUsage returns the raw body of the OAuth usage endpoint (per-window
+// and per-model plan limits). endpoint is normally UsageURL.
+func (o *ClaudeAuth) FetchOAuthUsage(ctx context.Context, endpoint, accessToken string) ([]byte, error) {
+	return o.fetchOAuthControlPlaneJSONWithBeta(ctx, endpoint, accessToken, "usage", UsageBeta)
+}
+
+func (o *ClaudeAuth) fetchOAuthControlPlaneJSONWithBeta(ctx context.Context, endpoint, accessToken, label, beta string) ([]byte, error) {
 	if o == nil || o.httpClient == nil {
 		return nil, fmt.Errorf("fetch Claude OAuth %s: HTTP client is nil", label)
 	}
@@ -240,6 +254,9 @@ func (o *ClaudeAuth) fetchOAuthControlPlaneJSON(ctx context.Context, endpoint, a
 	}
 	applyClaudeOAuthAxiosHeaders(req)
 	req.Header.Set("Authorization", "Bearer "+accessToken)
+	if beta != "" {
+		req.Header.Set("anthropic-beta", beta)
+	}
 	req.Header.Set("Cache-Control", "no-cache")
 
 	resp, errDo := o.httpClient.Do(req)
