@@ -19,8 +19,10 @@ const AveragingMean = "mean"
 
 // Snapshot is the cached quota view of every Claude OAuth credential.
 type Snapshot struct {
+	// Enabled is false while polling is off; accounts are then empty.
+	Enabled     bool      `json:"enabled"`
 	GeneratedAt time.Time `json:"generated_at"`
-	// RefreshIntervalSeconds is -1 when upstream refresh is disabled.
+	// RefreshIntervalSeconds is the effective poll interval; 0 while disabled.
 	RefreshIntervalSeconds int       `json:"refresh_interval_seconds"`
 	Accounts               []Account `json:"accounts"`
 	Summary                Summary   `json:"summary"`
@@ -37,6 +39,8 @@ type Account struct {
 	State     string `json:"state"`
 	// FetchedAt is the time of the last successful fetch.
 	FetchedAt *time.Time `json:"fetched_at"`
+	// NextPollAt is when the next upstream poll is scheduled; nil while paused.
+	NextPollAt *time.Time `json:"next_poll_at"`
 	// Stale is set when the last attempt failed or the value outlived two intervals.
 	Stale bool `json:"stale"`
 	// Refreshing is set while a fetch for this credential is in flight.
@@ -108,6 +112,10 @@ func (e *entry) account(now time.Time, interval time.Duration) Account {
 		Refreshing: e.inflight,
 		Error:      e.err,
 	}
+	if !e.cred.Disabled && e.rejectedToken == "" {
+		nextAt := e.nextAt
+		account.NextPollAt = &nextAt
+	}
 	if e.cred.CooldownUntil.After(now) {
 		until := e.cred.CooldownUntil
 		account.CooldownUntil = &until
@@ -128,7 +136,7 @@ func (e *entry) account(now time.Time, interval time.Duration) Account {
 	}
 	fetchedAt := e.fetchedAt
 	account.FetchedAt = &fetchedAt
-	account.Stale = e.err != "" || (interval > 0 && now.Sub(e.fetchedAt) > staleAfterIntervals*interval)
+	account.Stale = e.err != "" || now.Sub(e.fetchedAt) > staleAfterIntervals*interval
 	account.Session = e.usage.Session
 	account.WeeklyAll = e.usage.WeeklyAll
 	account.WeeklyScoped = e.usage.Scoped

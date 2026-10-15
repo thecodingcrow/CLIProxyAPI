@@ -2,6 +2,9 @@ package claudequota
 
 import (
 	"context"
+	"errors"
+	"fmt"
+	"net/http"
 	"strings"
 	"time"
 
@@ -19,7 +22,7 @@ type ClaudeFetcher struct {
 	Config func() *config.Config
 }
 
-// Fetch implements Fetcher.
+// Fetch implements Fetcher. A 401/403 wraps ErrCredentialRejected.
 func (f ClaudeFetcher) Fetch(ctx context.Context, cred Credential) (*Usage, error) {
 	var cfg *config.Config
 	if f.Config != nil {
@@ -27,6 +30,10 @@ func (f ClaudeFetcher) Fetch(ctx context.Context, cred Credential) (*Usage, erro
 	}
 	body, err := claudeauth.NewClaudeAuthWithProxyURL(cfg, cred.ProxyURL).FetchOAuthUsage(ctx, UsageEndpoint(cfg), cred.AccessToken)
 	if err != nil {
+		var statusErr *claudeauth.ControlPlaneStatusError
+		if errors.As(err, &statusErr) && (statusErr.StatusCode == http.StatusUnauthorized || statusErr.StatusCode == http.StatusForbidden) {
+			return nil, fmt.Errorf("%w: %v", ErrCredentialRejected, err)
+		}
 		return nil, err
 	}
 	return ParseUsage(body)
@@ -44,10 +51,11 @@ func UsageEndpoint(cfg *config.Config) string {
 	return base + usagePath
 }
 
-// RefreshInterval converts the configured seconds for NewStore.
-func RefreshInterval(cfg *config.Config) time.Duration {
+// SettingsFromConfig maps upstream.claude.usage-quota onto store settings.
+func SettingsFromConfig(cfg *config.Config) Settings {
 	if cfg == nil {
-		return 0
+		return Settings{}
 	}
-	return time.Duration(cfg.Claude.UsageQuota.RefreshIntervalSeconds) * time.Second
+	quota := cfg.Claude.UsageQuota
+	return Settings{Enabled: quota.Enabled, Interval: time.Duration(quota.RefreshIntervalMinutes) * time.Minute}
 }

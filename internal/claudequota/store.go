@@ -2,6 +2,8 @@ package claudequota
 
 import (
 	"context"
+	"errors"
+	"math/rand/v2"
 	"sort"
 	"sync"
 	"time"
@@ -11,15 +13,24 @@ import (
 
 const (
 	// DefaultRefreshInterval applies when the configured interval is zero.
-	DefaultRefreshInterval = 60 * time.Second
-	// tickEvery bounds how late a due refresh or a new cooldown is noticed.
-	tickEvery = 5 * time.Second
-	// earlyRefreshGap is the minimum age of the last attempt before a new
-	// quota cooldown pulls a refresh forward.
-	earlyRefreshGap = 15 * time.Second
+	DefaultRefreshInterval = 10 * time.Minute
+	// MinRefreshInterval is the floor for any configured interval.
+	MinRefreshInterval = 5 * time.Minute
+	// MaxBackoff caps the retry delay after consecutive failures.
+	MaxBackoff = time.Hour
+	// backoffJitter is the maximum extra fraction added to a backoff delay.
+	backoffJitter = 0.2
+	// fetchSpacing separates consecutive fetches inside one serial round.
+	fetchSpacing = 2 * time.Second
+	// tickEvery bounds how late a due poll starts.
+	tickEvery = 30 * time.Second
 	// staleAfterIntervals marks a value stale once it is this many intervals old.
 	staleAfterIntervals = 2
 )
+
+// ErrCredentialRejected marks a fetch the upstream refused for the credential
+// itself (401/403). Polling for it pauses until its access token changes.
+var ErrCredentialRejected = errors.New("credential rejected by usage endpoint")
 
 // Credential is the routing-relevant view of one Claude OAuth credential.
 type Credential struct {
@@ -47,11 +58,29 @@ type Fetcher interface {
 	Fetch(ctx context.Context, cred Credential) (*Usage, error)
 }
 
+// Settings is the live polling configuration, read on every tick and read.
+type Settings struct {
+	Enabled bool
+	// Interval is clamped to [MinRefreshInterval, ∞); zero means DefaultRefreshInterval.
+	Interval time.Duration
+}
+
+// Options supplies the clock, pause and randomness sources; zero values use
+// the wall clock, a real timer and math/rand.
+type Options struct {
+	Now func() time.Time
+	// Pause waits d between serial fetches; false aborts the round.
+	Pause func(ctx context.Context, d time.Duration) bool
+	// Jitter returns a value in [0, 1) scaling the backoff jitter.
+	Jitter func() float64
+}
+
 // Reader is the read side routing consumes. Both calls are memory-only.
 type Reader interface {
 	// HasQuota reports whether authID may serve model by its last good usage
-	// and its quota cooldowns as of the last sync. known is false when no usage
-	// was ever fetched for authID.
+	// and its quota cooldowns as of the last sync. known is false when polling
+	// is off or no usage was ever fetched; ok is then true, and callers must
+	// never block routing on an unknown answer.
 	HasQuota(authID, model string) (ok, known bool)
 	Snapshot() Snapshot
 }
@@ -60,55 +89,88 @@ type entry struct {
 	cred      Credential
 	usage     *Usage
 	fetchedAt time.Time
-	attemptAt time.Time
+	nextAt    time.Time
+	failures  int
 	err       string
 	inflight  bool
-	// cooldownBumped records a new quota cooldown not yet answered by a refresh.
-	cooldownBumped bool
+	// rejectedToken is the access token the upstream refused; polling resumes
+	// once the credential carries a different one.
+	rejectedToken string
+}
+
+func (e *entry) pollable(now time.Time) bool {
+	return !e.cred.Disabled && e.cred.AccessToken != "" && e.rejectedToken == "" && !now.Before(e.nextAt)
 }
 
 // Store caches usage per credential. Snapshot and HasQuota only read memory;
-// Tick (driven by Run) owns every upstream call, at most one per credential at
-// a time, and a failing or hung credential never delays the others.
+// Tick owns every upstream call: never before one full interval after a
+// credential is first seen, one serial round at a time with spacing, and
+// exponential backoff with jitter after failures.
 type Store struct {
 	source   Source
 	fetcher  Fetcher
-	interval func() time.Duration
+	settings func() Settings
 	now      func() time.Time
+	pause    func(ctx context.Context, d time.Duration) bool
+	jitter   func() float64
 
 	mu      sync.Mutex
 	entries map[string]*entry
+	running bool
 }
 
 var _ Reader = (*Store)(nil)
 
-// NewStore builds a store. interval is read on every tick so configuration
-// reloads apply without restart; zero means DefaultRefreshInterval and a
-// negative value stops upstream refreshes.
-func NewStore(source Source, fetcher Fetcher, interval func() time.Duration) *Store {
-	return &Store{
+// NewStore builds a store; settings is read on every tick so configuration
+// reloads apply without restart.
+func NewStore(source Source, fetcher Fetcher, settings func() Settings, opts Options) *Store {
+	s := &Store{
 		source:   source,
 		fetcher:  fetcher,
-		interval: interval,
-		now:      time.Now,
+		settings: settings,
+		now:      opts.Now,
+		pause:    opts.Pause,
+		jitter:   opts.Jitter,
 		entries:  map[string]*entry{},
 	}
+	if s.now == nil {
+		s.now = time.Now
+	}
+	if s.pause == nil {
+		s.pause = sleepContext
+	}
+	if s.jitter == nil {
+		s.jitter = rand.Float64
+	}
+	return s
 }
 
-func (s *Store) refreshInterval() time.Duration {
-	if s.interval == nil {
-		return DefaultRefreshInterval
+func sleepContext(ctx context.Context, d time.Duration) bool {
+	timer := time.NewTimer(d)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return false
+	case <-timer.C:
+		return true
 	}
-	interval := s.interval()
+}
+
+func (s *Store) currentSettings() (enabled bool, interval time.Duration) {
+	if s.settings == nil {
+		return false, 0
+	}
+	st := s.settings()
+	interval = st.Interval
 	if interval == 0 {
-		return DefaultRefreshInterval
+		interval = DefaultRefreshInterval
 	}
-	return interval
+	return st.Enabled, max(interval, MinRefreshInterval)
 }
 
-// Run refreshes immediately, then every tickEvery until ctx ends.
+// Run ticks every tickEvery until ctx ends. It does not poll at start: the
+// first poll of a credential waits one full interval.
 func (s *Store) Run(ctx context.Context) {
-	s.Tick(ctx)
 	ticker := time.NewTicker(tickEvery)
 	defer ticker.Stop()
 	for {
@@ -121,83 +183,113 @@ func (s *Store) Run(ctx context.Context) {
 	}
 }
 
-// Tick syncs credentials from the source and starts a background fetch for
-// every enabled credential that is due and not already in flight. The returned
-// channel closes once the fetches started by this tick finish.
+// Tick syncs credentials and, unless a round is still running, starts one
+// serial round over every due credential. Disabled polling drops the cache.
+// The returned channel closes when the started round ends.
 func (s *Store) Tick(ctx context.Context) <-chan struct{} {
-	s.sync()
 	done := make(chan struct{})
-	interval := s.refreshInterval()
-	if interval < 0 || s.fetcher == nil {
+	enabled, interval := s.currentSettings()
+	if !enabled || s.fetcher == nil {
+		s.mu.Lock()
+		s.entries = map[string]*entry{}
+		s.mu.Unlock()
 		close(done)
 		return done
 	}
 	now := s.now()
-	var due []Credential
-	s.mu.Lock()
-	for _, e := range s.entries {
-		if e.cred.Disabled || e.inflight || !e.due(now, interval) {
-			continue
-		}
-		e.inflight = true
-		e.attemptAt = now
-		e.cooldownBumped = false
-		due = append(due, e.cred)
-	}
-	s.mu.Unlock()
+	s.sync(now, interval)
 
-	var wg sync.WaitGroup
-	for _, cred := range due {
-		wg.Add(1)
-		go func(cred Credential) {
-			defer wg.Done()
-			s.fetch(ctx, cred)
-		}(cred)
-	}
-	go func() {
-		wg.Wait()
+	s.mu.Lock()
+	if s.running {
+		s.mu.Unlock()
 		close(done)
+		return done
+	}
+	var due []Credential
+	for _, e := range s.entries {
+		if e.pollable(now) {
+			due = append(due, e.cred)
+		}
+	}
+	if len(due) == 0 {
+		s.mu.Unlock()
+		close(done)
+		return done
+	}
+	s.running = true
+	s.mu.Unlock()
+	sort.Slice(due, func(i, j int) bool { return due[i].ID < due[j].ID })
+
+	go func() {
+		defer close(done)
+		defer func() {
+			s.mu.Lock()
+			s.running = false
+			s.mu.Unlock()
+		}()
+		for i, cred := range due {
+			if i > 0 && !s.pause(ctx, fetchSpacing) {
+				return
+			}
+			s.fetch(ctx, cred, interval)
+		}
 	}()
 	return done
 }
 
-func (e *entry) due(now time.Time, interval time.Duration) bool {
-	if e.attemptAt.IsZero() {
-		return true
+func (s *Store) fetch(ctx context.Context, cred Credential, interval time.Duration) {
+	s.mu.Lock()
+	e, ok := s.entries[cred.ID]
+	if !ok {
+		s.mu.Unlock()
+		return
 	}
-	age := now.Sub(e.attemptAt)
-	return age >= interval || (e.cooldownBumped && age >= earlyRefreshGap)
-}
+	e.inflight = true
+	s.mu.Unlock()
 
-func (s *Store) fetch(ctx context.Context, cred Credential) {
 	usage, err := s.fetcher.Fetch(ctx, cred)
+
 	now := s.now()
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	e, ok := s.entries[cred.ID]
-	if !ok {
-		return
-	}
 	e.inflight = false
-	if err != nil {
-		e.err = err.Error()
-		log.WithField("auth_id", cred.ID).Debugf("claude quota refresh failed: %v", err)
+	if s.entries[cred.ID] != e {
 		return
 	}
-	e.usage = usage
-	e.fetchedAt = now
-	e.err = ""
+	if err == nil {
+		e.usage, e.fetchedAt, e.err, e.failures = usage, now, "", 0
+		e.nextAt = now.Add(interval)
+		return
+	}
+	e.err = err.Error()
+	e.failures++
+	if errors.Is(err, ErrCredentialRejected) {
+		e.rejectedToken = cred.AccessToken
+		log.WithField("auth_id", cred.ID).Warn("claude quota polling paused until the access token changes")
+		return
+	}
+	e.nextAt = now.Add(s.backoff(interval, e.failures))
+	log.WithField("auth_id", cred.ID).Debugf("claude quota refresh failed: %v", err)
 }
 
-// sync mirrors the source into entries: new credentials start pending,
-// vanished ones are dropped, and a cooldown that moves later flags an early
-// refresh.
-func (s *Store) sync() {
+// backoff doubles interval per consecutive failure, adds up to backoffJitter,
+// and caps at MaxBackoff.
+func (s *Store) backoff(interval time.Duration, failures int) time.Duration {
+	delay := interval
+	for i := 0; i < failures && delay < MaxBackoff; i++ {
+		delay *= 2
+	}
+	delay = time.Duration(float64(delay) * (1 + backoffJitter*s.jitter()))
+	return min(delay, MaxBackoff)
+}
+
+// sync mirrors the source into entries: new credentials wait one interval,
+// vanished ones are dropped, and a changed token lifts a rejection.
+func (s *Store) sync(now time.Time, interval time.Duration) {
 	if s.source == nil {
 		return
 	}
 	creds := s.source()
-	now := s.now()
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	seen := make(map[string]struct{}, len(creds))
@@ -205,11 +297,12 @@ func (s *Store) sync() {
 		seen[cred.ID] = struct{}{}
 		e, ok := s.entries[cred.ID]
 		if !ok {
-			s.entries[cred.ID] = &entry{cred: cred}
+			s.entries[cred.ID] = &entry{cred: cred, nextAt: now.Add(interval)}
 			continue
 		}
-		if cred.CooldownUntil.After(now) && cred.CooldownUntil.After(e.cred.CooldownUntil) {
-			e.cooldownBumped = true
+		if e.rejectedToken != "" && cred.AccessToken != e.rejectedToken {
+			e.rejectedToken = ""
+			e.nextAt = now
 		}
 		e.cred = cred
 	}
@@ -222,12 +315,15 @@ func (s *Store) sync() {
 
 // HasQuota implements Reader.
 func (s *Store) HasQuota(authID, model string) (ok, known bool) {
+	if enabled, _ := s.currentSettings(); !enabled {
+		return true, false
+	}
 	now := s.now()
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	e, exists := s.entries[authID]
 	if !exists || e.usage == nil {
-		return false, false
+		return true, false
 	}
 	if cooledDown(e.cred, now, func(id string) bool { return id == model }) {
 		return false, true
@@ -252,12 +348,15 @@ func cooledDown(cred Credential, now time.Time, matches func(modelID string) boo
 	return false
 }
 
-// Snapshot implements Reader. It syncs credentials from the source (memory
-// only) so new, removed and disabled credentials show without waiting a tick.
+// Snapshot implements Reader. With polling on it syncs credentials from the
+// source (memory only) so new, removed and disabled credentials show at once.
 func (s *Store) Snapshot() Snapshot {
-	s.sync()
 	now := s.now()
-	interval := s.refreshInterval()
+	enabled, interval := s.currentSettings()
+	if !enabled {
+		return Snapshot{Enabled: false, GeneratedAt: now, Accounts: []Account{}, Summary: summarize(nil, now)}
+	}
+	s.sync(now, interval)
 	s.mu.Lock()
 	accounts := make([]Account, 0, len(s.entries))
 	for _, e := range s.entries {
@@ -270,13 +369,10 @@ func (s *Store) Snapshot() Snapshot {
 		}
 		return accounts[i].ID < accounts[j].ID
 	})
-	seconds := int(interval / time.Second)
-	if interval < 0 {
-		seconds = -1
-	}
 	return Snapshot{
+		Enabled:                true,
 		GeneratedAt:            now,
-		RefreshIntervalSeconds: seconds,
+		RefreshIntervalSeconds: int(interval / time.Second),
 		Accounts:               accounts,
 		Summary:                summarize(accounts, now),
 	}

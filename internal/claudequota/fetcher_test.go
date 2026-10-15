@@ -2,6 +2,7 @@ package claudequota
 
 import (
 	"context"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -23,12 +24,12 @@ func TestClaudeFetcherReadsUsageFromConfiguredBaseURL(t *testing.T) {
 	}))
 	defer upstream.Close()
 
-	cfg, err := config.ParseConfigBytes([]byte("config-version: 8\nupstream:\n  claude:\n    usage-quota:\n      refresh-interval-seconds: 30\n      base-url: " + upstream.URL + "/\n"))
+	cfg, err := config.ParseConfigBytes([]byte("config-version: 8\nupstream:\n  claude:\n    usage-quota:\n      enabled: true\n      refresh-interval-minutes: 15\n      base-url: " + upstream.URL + "/\n"))
 	if err != nil {
 		t.Fatalf("ParseConfigBytes() error = %v", err)
 	}
-	if got := RefreshInterval(cfg); got != 30*time.Second {
-		t.Fatalf("RefreshInterval = %v, want 30s from upstream.claude.usage-quota", got)
+	if got := SettingsFromConfig(cfg); !got.Enabled || got.Interval != 15*time.Minute {
+		t.Fatalf("SettingsFromConfig = %+v, want enabled with 15m from upstream.claude.usage-quota", got)
 	}
 
 	usage, err := ClaudeFetcher{Config: func() *config.Config { return cfg }}.Fetch(context.Background(), Credential{ID: "a", AccessToken: "fake-token"})
@@ -54,8 +55,30 @@ func TestClaudeFetcherSurfacesUpstreamStatus(t *testing.T) {
 	}
 }
 
-func TestUsageEndpointDefaultsToAnthropic(t *testing.T) {
-	if got := UsageEndpoint(&config.Config{}); got != "https://api.anthropic.com/api/oauth/usage" {
+func TestClaudeFetcherMarksAuthFailuresRejected(t *testing.T) {
+	for _, status := range []int{http.StatusUnauthorized, http.StatusForbidden} {
+		upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			http.Error(w, "nope", status)
+		}))
+		cfg := &config.Config{}
+		cfg.Claude.UsageQuota.BaseURL = upstream.URL
+		_, err := ClaudeFetcher{Config: func() *config.Config { return cfg }}.Fetch(context.Background(), Credential{ID: "a", AccessToken: "fake-token"})
+		upstream.Close()
+		if !errors.Is(err, ErrCredentialRejected) {
+			t.Fatalf("status %d: error = %v, want ErrCredentialRejected", status, err)
+		}
+	}
+}
+
+func TestOldConfigLeavesPollingOffWithAnthropicDefaults(t *testing.T) {
+	cfg, err := config.ParseConfigBytes([]byte("config-version: 8\nupstream:\n  claude:\n    model-level-cooling: false\n"))
+	if err != nil {
+		t.Fatalf("ParseConfigBytes() error = %v", err)
+	}
+	if got := SettingsFromConfig(cfg); got.Enabled {
+		t.Fatalf("SettingsFromConfig = %+v, want polling off without usage-quota", got)
+	}
+	if got := UsageEndpoint(cfg); got != "https://api.anthropic.com/api/oauth/usage" {
 		t.Fatalf("UsageEndpoint = %q, want api.anthropic.com", got)
 	}
 }
