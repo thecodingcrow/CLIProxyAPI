@@ -29,11 +29,7 @@ const (
 	ProfileURL      = "https://api.anthropic.com/api/oauth/profile"
 	// RolesURL is the claude_cli role endpoint the native client queries right
 	// after a successful token exchange, alongside the profile lookup.
-	RolesURL = "https://api.anthropic.com/api/oauth/claude_cli/roles"
-	// UsageURL reports the plan limits (session, weekly, model-scoped weekly)
-	// of an OAuth account; it requires the UsageBeta header.
-	UsageURL         = "https://api.anthropic.com/api/oauth/usage"
-	UsageBeta        = "oauth-2025-04-20"
+	RolesURL         = "https://api.anthropic.com/api/oauth/claude_cli/roles"
 	ClientID         = "9d1c250a-e61b-44d9-88ed-5944d1962f5e"
 	RedirectURI      = "http://localhost:54545/callback"
 	ClaudeOAuthScope = "user:profile user:inference user:sessions:claude_code user:mcp_servers user:file_upload"
@@ -228,29 +224,9 @@ func applyClaudeOAuthAxiosHeaders(req *http.Request) {
 	req.Close = true
 }
 
-// ControlPlaneStatusError is a non-2xx answer from an OAuth control-plane GET.
-type ControlPlaneStatusError struct {
-	Label      string
-	StatusCode int
-}
-
-func (e *ControlPlaneStatusError) Error() string {
-	return fmt.Sprintf("fetch Claude OAuth %s failed with status %d", e.Label, e.StatusCode)
-}
-
 // fetchOAuthControlPlaneJSON issues an Axios-shaped OAuth control-plane GET and
 // returns the decoded response body. label names the endpoint in error text.
 func (o *ClaudeAuth) fetchOAuthControlPlaneJSON(ctx context.Context, endpoint, accessToken, label string) ([]byte, error) {
-	return o.fetchOAuthControlPlaneJSONWithBeta(ctx, endpoint, accessToken, label, "")
-}
-
-// FetchOAuthUsage returns the raw body of the OAuth usage endpoint (per-window
-// and per-model plan limits). endpoint is normally UsageURL.
-func (o *ClaudeAuth) FetchOAuthUsage(ctx context.Context, endpoint, accessToken string) ([]byte, error) {
-	return o.fetchOAuthControlPlaneJSONWithBeta(ctx, endpoint, accessToken, "usage", UsageBeta)
-}
-
-func (o *ClaudeAuth) fetchOAuthControlPlaneJSONWithBeta(ctx context.Context, endpoint, accessToken, label, beta string) ([]byte, error) {
 	if o == nil || o.httpClient == nil {
 		return nil, fmt.Errorf("fetch Claude OAuth %s: HTTP client is nil", label)
 	}
@@ -264,9 +240,6 @@ func (o *ClaudeAuth) fetchOAuthControlPlaneJSONWithBeta(ctx context.Context, end
 	}
 	applyClaudeOAuthAxiosHeaders(req)
 	req.Header.Set("Authorization", "Bearer "+accessToken)
-	if beta != "" {
-		req.Header.Set("anthropic-beta", beta)
-	}
 	req.Header.Set("Cache-Control", "no-cache")
 
 	resp, errDo := o.httpClient.Do(req)
@@ -283,7 +256,7 @@ func (o *ClaudeAuth) fetchOAuthControlPlaneJSONWithBeta(ctx context.Context, end
 		return nil, fmt.Errorf("read Claude OAuth %s response: %w", label, errRead)
 	}
 	if resp.StatusCode < http.StatusOK || resp.StatusCode >= http.StatusMultipleChoices {
-		return nil, &ControlPlaneStatusError{Label: label, StatusCode: resp.StatusCode}
+		return nil, fmt.Errorf("fetch Claude OAuth %s failed with status %d", label, resp.StatusCode)
 	}
 	return body, nil
 }
