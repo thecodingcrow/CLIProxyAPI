@@ -75,14 +75,27 @@ type Options struct {
 	Jitter func() float64
 }
 
-// Reader is the read side routing consumes. Both calls are memory-only.
+// Reader is the read side routing consumes. Every call is memory-only.
 type Reader interface {
-	// HasQuota reports whether authID may serve model by its last good usage
-	// and its quota cooldowns as of the last sync. known is false when polling
-	// is off or no usage was ever fetched; ok is then true, and callers must
-	// never block routing on an unknown answer.
+	// HasQuota is Status reduced to (OK, Known).
 	HasQuota(authID, model string) (ok, known bool)
+	// Status judges authID for model by its last good usage and its quota
+	// cooldowns as of the last sync.
+	Status(authID, model string) Status
 	Snapshot() Snapshot
+}
+
+// Status is one credential's standing for one model.
+type Status struct {
+	// Known is false while polling is off, before the first good fetch and once
+	// that value is older than staleAfterIntervals; callers must never block
+	// routing on an unknown answer.
+	Known bool
+	// OK reports quota for the model; always true when Known is false.
+	OK bool
+	// ResetAt is when the last window or cooldown blocking the model ends; zero
+	// when OK or when a blocking window reports no reset time.
+	ResetAt time.Time
 }
 
 type entry struct {
@@ -238,9 +251,12 @@ func (s *Store) Tick(ctx context.Context) <-chan struct{} {
 }
 
 // reset drops the cache; a later enable starts every credential's wait anew.
+// An empty cache is kept: routing reads call this per request while polling is off.
 func (s *Store) reset() {
 	s.mu.Lock()
-	s.entries = map[string]*entry{}
+	if len(s.entries) > 0 {
+		s.entries = map[string]*entry{}
+	}
 	s.mu.Unlock()
 }
 
@@ -339,38 +355,61 @@ func (s *Store) sync(now time.Time, interval time.Duration) {
 
 // HasQuota implements Reader.
 func (s *Store) HasQuota(authID, model string) (ok, known bool) {
-	if enabled, _ := s.currentSettings(); !enabled {
+	status := s.Status(authID, model)
+	return status.OK, status.Known
+}
+
+// Status implements Reader.
+func (s *Store) Status(authID, model string) Status {
+	enabled, interval := s.currentSettings()
+	if !enabled {
 		s.reset()
-		return true, false
+		return Status{OK: true}
 	}
 	now := s.now()
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	e, exists := s.entries[authID]
-	if !exists || e.usage == nil {
-		return true, false
+	if !exists || e.usage == nil || now.Sub(e.fetchedAt) > staleAfterIntervals*interval {
+		return Status{OK: true}
 	}
-	if cooledDown(e.cred, now, func(id string) bool { return id == model }) {
-		return false, true
+	blocked, until := e.usage.blockedUntil(model, now)
+	if cooled := cooldownUntil(e.cred, now, func(id string) bool { return id == model }); !cooled.IsZero() {
+		// A window without reset time keeps the reset unknown.
+		if !blocked || (!until.IsZero() && cooled.After(until)) {
+			until = cooled
+		}
+		blocked = true
 	}
-	return e.usage.HasQuota(model, now), true
+	if !blocked {
+		return Status{Known: true, OK: true}
+	}
+	return Status{Known: true, ResetAt: until}
 }
 
 // cooledDown reports a credential-wide cooldown, or a model cooldown whose
 // model ID satisfies matches.
 func cooledDown(cred Credential, now time.Time, matches func(modelID string) bool) bool {
+	return !cooldownUntil(cred, now, matches).IsZero()
+}
+
+// cooldownUntil returns the latest active cooldown end among the
+// credential-wide one and model cooldowns whose model ID satisfies matches;
+// zero when none is active.
+func cooldownUntil(cred Credential, now time.Time, matches func(modelID string) bool) time.Time {
+	var until time.Time
 	if cred.CooldownUntil.After(now) {
-		return true
+		until = cred.CooldownUntil
 	}
 	if matches == nil {
-		return false
+		return until
 	}
-	for modelID, until := range cred.ModelCooldowns {
-		if until.After(now) && matches(modelID) {
-			return true
+	for modelID, end := range cred.ModelCooldowns {
+		if end.After(now) && end.After(until) && matches(modelID) {
+			until = end
 		}
 	}
-	return false
+	return until
 }
 
 // Snapshot implements Reader. With polling on it syncs credentials from the

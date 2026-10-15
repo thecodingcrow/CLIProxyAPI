@@ -128,15 +128,37 @@ func (u *Usage) HasQuota(model string, now time.Time) bool {
 	if u == nil {
 		return false
 	}
-	if u.Session.exhausted(now) || u.WeeklyAll.exhausted(now) {
-		return false
-	}
-	for name, limit := range u.Scoped {
-		if ScopeMatchesModel(name, model) && limit.exhausted(now) {
-			return false
+	blocked, _ := u.blockedUntil(model, now)
+	return !blocked
+}
+
+// blockedUntil reports whether the windows HasQuota checks block model at now
+// and when the last of them resets; zero when one reports no reset time.
+func (u *Usage) blockedUntil(model string, now time.Time) (blocked bool, until time.Time) {
+	unknownReset := false
+	check := func(limit *Limit) {
+		if !limit.exhausted(now) {
+			return
+		}
+		blocked = true
+		switch {
+		case limit.ResetsAt == nil:
+			unknownReset = true
+		case limit.ResetsAt.After(until):
+			until = *limit.ResetsAt
 		}
 	}
-	return true
+	check(u.Session)
+	check(u.WeeklyAll)
+	for name, limit := range u.Scoped {
+		if ScopeMatchesModel(name, model) {
+			check(&limit)
+		}
+	}
+	if unknownReset {
+		return blocked, time.Time{}
+	}
+	return blocked, until
 }
 
 // ScopeMatchesModel reports whether a scoped limit's display name names model:
