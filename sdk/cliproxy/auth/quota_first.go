@@ -85,8 +85,10 @@ func (s *QuotaFirstSelector) Pick(ctx context.Context, provider, model string, o
 		return nil, err
 	}
 	available = preferCodexWebsocketAuths(ctx, provider, available)
-	if lookup, _ := ctx.Value(quotaLookupKey{}).(quotaLookup); lookup != nil {
-		available = quotaPreferredAuths(available, lookup)
+	if ctx != nil {
+		if lookup, _ := ctx.Value(quotaLookupKey{}).(quotaLookup); lookup != nil {
+			available = quotaPreferredAuths(available, lookup)
+		}
 	}
 	return s.rr.next(provider+":"+canonicalModelKey(model), available), nil
 }
