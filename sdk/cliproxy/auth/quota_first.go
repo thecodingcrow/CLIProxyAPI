@@ -10,6 +10,9 @@ import (
 
 // QuotaStatus is a credential's cached plan-limit standing for one model.
 type QuotaStatus struct {
+	// Tracked reports a credential the provider has plan limits for; Known
+	// implies it. Untracked ones serve only when no tracked one has quota.
+	Tracked bool
 	// Known is false without usable data; routing then treats the credential
 	// as available.
 	Known bool
@@ -116,40 +119,42 @@ func drainPressure(status QuotaStatus, now time.Time) float64 {
 }
 
 // quotaPreferredAuths narrows candidates to their best quota tier, keeping
-// order so rotation continues within it. Unknown credentials join the top
-// pressure tier: their first response reports their quota, so ranking them
-// lower would starve them of the traffic that makes them known.
+// order so rotation continues within it. Tiers: top pressure plus tracked
+// unknowns, then untracked, then the soonest-ending exhausted. Tracked
+// unknowns tie the leader: their first response reports their quota, so
+// ranking them lower would starve them of the traffic that makes them known.
 func quotaPreferredAuths(available []*Auth, lookup quotaLookup, now time.Time) []*Auth {
 	statuses := make([]QuotaStatus, len(available))
 	pressures := make([]float64, len(available))
-	best, anyPreferred := math.Inf(-1), false
+	best := math.Inf(-1)
 	for i, auth := range available {
 		statuses[i] = lookup(auth)
-		switch {
-		case !statuses[i].Known:
-			anyPreferred = true
-		case statuses[i].Available:
-			anyPreferred = true
+		if statuses[i].Known && statuses[i].Available {
 			pressures[i] = drainPressure(statuses[i], now)
 			best = math.Max(best, pressures[i])
 		}
 	}
-	var preferred, soonest []*Auth
+	var preferred, untracked, soonest []*Auth
 	var soonestAt time.Time
 	for i, auth := range available {
 		status := statuses[i]
 		switch {
+		case !status.Known && !status.Tracked:
+			untracked = append(untracked, auth)
 		case !status.Known || (status.Available && pressures[i] == best):
 			preferred = append(preferred, auth)
-		case anyPreferred || status.Available: // outranked
+		case status.Available: // below the leader, never in the exhausted tier
 		case len(soonest) == 0 || resetsEarlier(status.ResetAt, soonestAt):
 			soonest, soonestAt = []*Auth{auth}, status.ResetAt
 		case status.ResetAt.Equal(soonestAt):
 			soonest = append(soonest, auth)
 		}
 	}
-	if anyPreferred {
+	switch {
+	case len(preferred) > 0:
 		return preferred
+	case len(untracked) > 0:
+		return untracked
 	}
 	return soonest
 }

@@ -11,7 +11,7 @@ import (
 	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/executor"
 )
 
-// fakeQuota answers from a mutable in-memory table; absent IDs are unknown.
+// fakeQuota answers from a mutable in-memory table; absent IDs are untracked.
 type fakeQuota struct {
 	mu     sync.Mutex
 	status map[string]QuotaStatus
@@ -34,6 +34,7 @@ func (f *fakeQuota) set(authID string, status QuotaStatus) {
 
 var (
 	quotaOK        = QuotaStatus{Known: true, Available: true}
+	quotaUnknown   = QuotaStatus{Tracked: true}
 	quotaResetNext = time.Date(2026, 10, 16, 0, 0, 0, 0, time.UTC)
 	quotaResetLate = time.Date(2026, 10, 20, 0, 0, 0, 0, time.UTC)
 )
@@ -128,9 +129,10 @@ func TestQuotaFirstWithoutQuotaDataMatchesRoundRobin(t *testing.T) {
 
 	assertSequence(t, "round-robin", sequence(t, "qf-rr-baseline", nil, nil), want...)
 	for name, quota := range map[string]QuotaProvider{
-		"none":    nil,
-		"off":     &fakeQuota{},
-		"unknown": &fakeQuota{status: map[string]QuotaStatus{"qf-rr-unknown-a": {}, "qf-rr-unknown-b": {}}},
+		"none":      nil,
+		"off":       &fakeQuota{},
+		"unknown":   &fakeQuota{status: map[string]QuotaStatus{"qf-rr-unknown-a": quotaUnknown, "qf-rr-unknown-b": quotaUnknown, "qf-rr-unknown-c": quotaUnknown}},
+		"untracked": &fakeQuota{status: map[string]QuotaStatus{"qf-rr-untracked-a": {}}},
 	} {
 		t.Run(name, func(t *testing.T) {
 			assertSequence(t, "quota-first", sequence(t, "qf-rr-"+name, &QuotaFirstSelector{}, quota), want...)
@@ -185,6 +187,7 @@ func TestQuotaFirstPrefersTheCredentialWhoseBlockEndsSoonest(t *testing.T) {
 func TestQuotaFirstRanksUnknownWithHealthyAndAboveExhausted(t *testing.T) {
 	quota := &fakeQuota{}
 	quota.set("qf-mix-a-healthy", quotaOK)
+	quota.set("qf-mix-b-unknown", quotaUnknown)
 	quota.set("qf-mix-c-exhausted", quotaExhausted(quotaResetNext))
 	h := newQuotaFirstHarness(t, "qf-mix", &QuotaFirstSelector{}, quota, "qf-mix-a-healthy", "qf-mix-b-unknown", "qf-mix-c-exhausted")
 
@@ -247,9 +250,38 @@ func TestQuotaFirstSharesTheTopTierWithAnUnknownCredential(t *testing.T) {
 	quota := &fakeQuota{}
 	quota.set("qf-probe-a", quotaLeft(80, reset))
 	quota.set("qf-probe-b", quotaLeft(30, reset))
+	quota.set("qf-probe-c-unknown", quotaUnknown)
 	h := newQuotaFirstHarness(t, "qf-probe", &QuotaFirstSelector{}, quota, "qf-probe-a", "qf-probe-b", "qf-probe-c-unknown")
 
 	assertSequence(t, "picks", h.picks(4), "qf-probe-a", "qf-probe-c-unknown", "qf-probe-a", "qf-probe-c-unknown")
+}
+
+func TestQuotaFirstServesUntrackedOnlyWithoutPlanQuotaAndBeforeExhausted(t *testing.T) {
+	quota := &fakeQuota{}
+	quota.set("qf-tier-a-leader", quotaLeft(80, time.Now().Add(72*time.Hour)))
+	quota.set("qf-tier-b-unknown", quotaUnknown)
+	h := newQuotaFirstHarness(t, "qf-tier", &QuotaFirstSelector{}, quota, "qf-tier-a-leader", "qf-tier-b-unknown", "qf-tier-c-untracked")
+
+	assertSequence(t, "picks", h.picks(4), "qf-tier-a-leader", "qf-tier-b-unknown", "qf-tier-a-leader", "qf-tier-b-unknown")
+	quota.set("qf-tier-a-leader", quotaExhausted(quotaResetNext))
+	assertSequence(t, "picks with only the unknown left", h.picks(2), "qf-tier-b-unknown", "qf-tier-b-unknown")
+	quota.set("qf-tier-b-unknown", quotaExhausted(quotaResetNext))
+	assertSequence(t, "picks with every tracked one exhausted", h.picks(2), "qf-tier-c-untracked", "qf-tier-c-untracked")
+}
+
+func TestQuotaFirstClampsTimeToResetAtOneHour(t *testing.T) {
+	now := time.Now()
+	quota := &fakeQuota{}
+	// Unclamped, a (10/0.5h = 20) would beat b (20/1.5h = 13.3).
+	quota.set("qf-clamp-a", quotaLeft(10, now.Add(30*time.Minute)))
+	quota.set("qf-clamp-b", quotaLeft(20, now.Add(90*time.Minute)))
+	h := newQuotaFirstHarness(t, "qf-clamp", &QuotaFirstSelector{}, quota, "qf-clamp-a", "qf-clamp-b")
+	assertSequence(t, "picks inside the last hours", h.picks(2), "qf-clamp-b", "qf-clamp-b")
+
+	// A reset already past ranks by raw headroom instead of going negative.
+	quota.set("qf-clamp-a", quotaLeft(50, now.Add(-time.Hour)))
+	quota.set("qf-clamp-b", quotaLeft(40, now.Add(30*time.Minute)))
+	assertSequence(t, "picks with a reset already past", h.picks(2), "qf-clamp-a", "qf-clamp-a")
 }
 
 func TestQuotaFirstUnderSessionAffinityKeepsBindingAndRebindsByQuota(t *testing.T) {
