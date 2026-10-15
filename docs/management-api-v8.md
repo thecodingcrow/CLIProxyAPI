@@ -98,6 +98,7 @@ retain the corresponding business operation's fields.
 | `/observability/logs/requests/<id>` | GET | Get a request log. |
 | `/observability/usage/api-keys` | GET | Get API-key usage. |
 | `/observability/usage/queue` | GET | Get queued usage events. |
+| `/observability/usage/models` | GET | Get in-memory token usage per provider, model and subagent flag over the 200-minute recent-request window (`bucket_seconds`, `window_minutes`, `generated_at`, `models[]` sorted by `total_tokens` desc; optional `node_kinds` request counts). |
 | `/credentials` | GET, POST, DELETE | List, upload, or delete credential files. |
 | `/credentials/models` | GET | Get credential models. |
 | `/credentials/download` | GET | Download a credential file. |
