@@ -50,8 +50,27 @@ var claudeOAuthInspectTargets = []string{
 	"/api/oauth/claude_cli/roles",
 }
 
+// claudeOAuthUsageHeaderOrder is the inspect order plus the anthropic-beta
+// header the usage endpoint requires, kept next to Authorization.
+var claudeOAuthUsageHeaderOrder = []string{
+	"Accept",
+	"Content-Type",
+	"Authorization",
+	"anthropic-beta",
+	"Cache-Control",
+	"User-Agent",
+	"Accept-Encoding",
+	"Host",
+	"Connection",
+}
+
+const claudeOAuthUsageTarget = "/api/oauth/usage"
+
 func claudeOAuthRequestHeaderOrder(method, requestTarget string) []string {
 	if method == http.MethodGet {
+		if strings.HasPrefix(requestTarget, claudeOAuthUsageTarget) {
+			return claudeOAuthUsageHeaderOrder
+		}
 		for _, target := range claudeOAuthInspectTargets {
 			if strings.HasPrefix(requestTarget, target) {
 				return claudeOAuthInspectHeaderOrder

@@ -422,6 +422,19 @@ upstream:
     # Default false keeps the translation and catalog behavior that predate tool_search support.
     tool-search: false
 
+    # Per-credential plan limits (session, weekly, model-scoped weekly) from Anthropic's
+    # OAuth usage endpoint, served cached at GET /v8/management/credentials/quota.
+    # Off by default: without enabled: true the proxy never calls /api/oauth/usage, also after a
+    # restart with an older config, and the endpoint answers {"enabled": false, ...}.
+    # When on: the first poll of a credential waits one full interval (none at startup); one
+    # serial round at a time with a short gap between credentials; errors and 429s back off
+    # exponentially with jitter up to 1h; a 401/403 pauses the credential until its access
+    # token changes. The endpoint only reads the cache and never triggers a fetch.
+    # usage-quota:
+    #   enabled: false
+    #   refresh-interval-minutes: 10  # default 10; values below 5 are raised to 5
+    #   base-url: ""                  # replaces https://api.anthropic.com for local fakes only
+
     # When true, disable Claude request cloaking on OAuth and API-key CLI profiles (the Claude Code CLI disguise and
     # system prompt replacement), so the original system prompt is passed through to Claude as-is.
     # Credential attributes and explicit per-key cloak modes override this shared default.

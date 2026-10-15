@@ -121,6 +121,20 @@ type ClaudeConfig struct {
 	// translation elsewhere, and per-credential search advertising in the Codex
 	// catalog. Default false keeps the translation that predates tool_search support.
 	ToolSearch bool `yaml:"tool-search" json:"tool-search"`
+	// UsageQuota configures the cached per-credential plan-limit refresher.
+	UsageQuota ClaudeUsageQuotaConfig `yaml:"usage-quota,omitempty" json:"usage-quota,omitempty"`
+}
+
+// ClaudeUsageQuotaConfig configures polling of Anthropic's OAuth usage endpoint.
+type ClaudeUsageQuotaConfig struct {
+	// Enabled turns polling on; off by default so no usage call happens unless opted in.
+	Enabled bool `yaml:"enabled,omitempty" json:"enabled,omitempty"`
+	// RefreshIntervalMinutes is the per-credential poll period: 0 means 10,
+	// values below 5 are raised to 5.
+	RefreshIntervalMinutes int `yaml:"refresh-interval-minutes,omitempty" json:"refresh-interval-minutes,omitempty"`
+	// BaseURL replaces https://api.anthropic.com for the usage call only; meant
+	// for local fakes. Empty keeps the real endpoint.
+	BaseURL string `yaml:"base-url,omitempty" json:"base-url,omitempty"`
 }
 
 // ClaudeHeaderDefaults configures the measured Claude Code software baseline.

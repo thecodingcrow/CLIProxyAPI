@@ -20,6 +20,7 @@ import (
 	"github.com/gin-gonic/gin"
 	managementHandlers "github.com/router-for-me/CLIProxyAPI/v8/internal/api/handlers/management"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/api/middleware"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/claudequota"
 	codexlive "github.com/router-for-me/CLIProxyAPI/v8/internal/client/codex/live"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/config"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/githubauth"
@@ -106,6 +107,11 @@ type Server struct {
 
 	exampleAPIKeySafeModeEnabled bool
 	exampleAPIKeySafeModeActive  atomic.Bool
+
+	// claudeQuota caches Claude plan limits; nil in Home mode or without an auth manager.
+	claudeQuota       *claudequota.Store
+	claudeQuotaMu     sync.Mutex
+	claudeQuotaCancel context.CancelFunc
 }
 
 // NewServer creates and initializes a new API server instance.
@@ -218,6 +224,10 @@ func NewServer(cfg *config.Config, authManager *auth.Manager, accessManager *sdk
 	// Initialize management handler
 	s.mgmt = managementHandlers.NewHandler(cfg, configFilePath, authManager)
 	s.mgmt.SetPluginHost(optionState.pluginHost)
+	if authManager != nil && !cfg.Home.Enabled {
+		s.claudeQuota = s.newClaudeQuotaStore(authManager, claudequota.Options{})
+		s.mgmt.SetClaudeQuota(s.claudeQuota)
+	}
 	s.mgmt.SetConfigReloadHook(optionState.configReloadHook)
 	if optionState.localPassword != "" {
 		s.mgmt.SetLocalPassword(optionState.localPassword)
@@ -335,6 +345,7 @@ func (s *Server) Start() error {
 		log.Debugf("Starting API server on %s", addr)
 	}
 
+	s.startClaudeQuota()
 	httpListener := newMuxListener(listener.Addr(), 1024)
 	s.listenerMu.Lock()
 	s.muxBaseListener = listener
@@ -414,6 +425,7 @@ func (s *Server) Start() error {
 //   - error: An error if the server fails to stop
 func (s *Server) Stop(ctx context.Context) error {
 	log.Debug("Stopping API server...")
+	s.stopClaudeQuota()
 
 	if s.keepAliveEnabled {
 		select {
