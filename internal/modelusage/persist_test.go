@@ -1,6 +1,7 @@
 package modelusage
 
 import (
+	"encoding/json"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -8,6 +9,8 @@ import (
 	"sync"
 	"testing"
 	"time"
+
+	coreauth "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/auth"
 )
 
 var allRanges = []Range{RangeWindow, RangeToday, Range7d, RangeTotal}
@@ -85,6 +88,140 @@ func TestMissingFileStartsEmpty(t *testing.T) {
 	}
 	if _, err := os.Stat(path); err != nil {
 		t.Fatalf("flush creates missing directory and file: %v", err)
+	}
+}
+
+// oldestBucketIDs returns, per key, the oldest bucket ID held in memory and in the state file.
+func oldestBucketIDs(t *testing.T, agg *Aggregator, path string) (memory, file map[string]int64) {
+	t.Helper()
+	memory, file = map[string]int64{}, map[string]int64{}
+	agg.mu.Lock()
+	for key, s := range agg.series {
+		if len(s.buckets) > 0 {
+			memory[key.Model] = s.buckets[0].ID
+		}
+	}
+	agg.mu.Unlock()
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var state fileState
+	if err := json.Unmarshal(raw, &state); err != nil {
+		t.Fatal(err)
+	}
+	for _, s := range state.Series {
+		for _, b := range s.Buckets {
+			if old, ok := file[s.Model]; !ok || b.ID < old {
+				file[s.Model] = b.ID
+			}
+		}
+	}
+	return memory, file
+}
+
+func TestPruneKeepsOnlySevenDaysInMemoryAndFile(t *testing.T) {
+	path := filepath.Join(t.TempDir(), FileName)
+	clock := newClock()
+	agg := New(clock.Now, 0)
+	agg.Open(path)
+	agg.Add(Key{Provider: "p", Model: "busy"}, Counters{Requests: 1})
+	agg.Add(Key{Provider: "p", Model: "idle"}, Counters{Requests: 1})
+	clock.Advance(8 * 24 * time.Hour)
+	agg.Add(Key{Provider: "p", Model: "busy"}, Counters{Requests: 1})
+	if err := agg.Flush(); err != nil {
+		t.Fatal(err)
+	}
+	firstKept := coreauth.RecentRequestBucketID(clock.Now()) - RetentionBuckets + 1
+
+	memory, file := oldestBucketIDs(t, agg, path)
+	for _, view := range []map[string]int64{memory, file} {
+		for model, oldest := range view {
+			if oldest < firstKept {
+				t.Fatalf("%s keeps bucket %d older than 7d (first kept %d); memory %v file %v", model, oldest, firstKept, memory, file)
+			}
+		}
+	}
+	if file["busy"] == 0 {
+		t.Fatalf("busy key's current bucket missing from file: %v", file)
+	}
+
+	reloaded := New(clock.Now, 0)
+	reloaded.Open(path)
+	reloaded.mu.Lock()
+	for key, s := range reloaded.series {
+		if len(s.buckets) > 0 && s.buckets[0].ID < firstKept {
+			t.Errorf("reloaded %s keeps bucket %d older than 7d (first kept %d)", key.Model, s.buckets[0].ID, firstKept)
+		}
+	}
+	reloaded.mu.Unlock()
+	if got := findRow(t, reloaded.Snapshot(RangeTotal), "p", "idle", false); got.Requests != 1 {
+		t.Fatalf("idle total after prune: %+v", got)
+	}
+}
+
+// A file written by a clock running ahead must neither hide its counts nor stop pruning.
+func TestFutureBucketsFromFileAreClampedAndPruningContinues(t *testing.T) {
+	path := filepath.Join(t.TempDir(), FileName)
+	clock := newClock()
+	ahead := &fakeClock{now: clock.Now().Add(8 * 24 * time.Hour)}
+	writer := New(ahead.Now, 0)
+	writer.Open(path)
+	writer.Add(Key{Provider: "p", Model: "m"}, Counters{Requests: 1, TotalTokens: 4})
+	if err := writer.Flush(); err != nil {
+		t.Fatal(err)
+	}
+
+	agg := New(clock.Now, 0)
+	agg.Add(Key{Provider: "p", Model: "m"}, Counters{Requests: 1, TotalTokens: 1}) // within 7 days of now
+	agg.Open(path)
+	agg.Add(Key{Provider: "p", Model: "m"}, Counters{Requests: 1, TotalTokens: 2})
+	if got := sumTokens(agg.Snapshot(Range7d)); got != 7 {
+		t.Fatalf("7d tokens %d, want 7: real buckets kept, future bucket counted now", got)
+	}
+
+	clock.Advance(8 * 24 * time.Hour)
+	agg.Add(Key{Provider: "p", Model: "m"}, Counters{Requests: 1, TotalTokens: 8})
+	if got := sumTokens(agg.Snapshot(Range7d)); got != 8 {
+		t.Fatalf("7d tokens %d after 8 days, want 8", got)
+	}
+	agg.mu.Lock()
+	n := len(agg.series[Key{Provider: "p", Model: "m"}].buckets)
+	agg.mu.Unlock()
+	if n != 1 {
+		t.Fatalf("%d buckets held, want 1: pruning stalled behind a future bucket", n)
+	}
+}
+
+func TestFailedFlushIsRetriedAndCleanFlushWritesNothing(t *testing.T) {
+	path := filepath.Join(t.TempDir(), FileName)
+	agg := New(newClock().Now, 0)
+	agg.Open(path)
+	if err := os.Mkdir(path, 0o755); err != nil { // rename onto a directory fails
+		t.Fatal(err)
+	}
+	agg.Add(Key{Provider: "p", Model: "m"}, Counters{Requests: 1})
+	if err := agg.Flush(); err == nil {
+		t.Fatal("flush onto a directory succeeded")
+	}
+	if err := os.Remove(path); err != nil {
+		t.Fatal(err)
+	}
+	if err := agg.Flush(); err != nil {
+		t.Fatal(err)
+	}
+	reloaded := New(newClock().Now, 0)
+	reloaded.Open(path)
+	findRow(t, reloaded.Snapshot(RangeTotal), "p", "m", false)
+
+	if err := os.WriteFile(path, []byte("sentinel"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := agg.Flush(); err != nil {
+		t.Fatal(err)
+	}
+	if raw, _ := os.ReadFile(path); string(raw) != "sentinel" {
+		t.Fatalf("flush without new usage rewrote the file: %q", raw)
 	}
 }
 

@@ -117,15 +117,16 @@ type series struct {
 	lastID  int64
 }
 
-// add counts c in bucket id and drops buckets that fell out of retention relative to id.
-func (s *series) add(id int64, c Counters) {
+// add counts c in bucket id, then drops buckets out of retention at currentID.
+// Retention follows the clock, never a bucket ID, so a future-dated bucket cannot prune real ones.
+func (s *series) add(id int64, c Counters, currentID int64) {
+	defer s.prune(currentID)
 	n := len(s.buckets)
 	switch {
 	case n > 0 && s.buckets[n-1].ID == id:
 		s.buckets[n-1].add(c)
 	case n == 0 || s.buckets[n-1].ID < id:
 		s.buckets = append(s.buckets, bucket{ID: id, Counters: c})
-		s.prune(id)
 	default: // clock stepped back
 		i := sort.Search(n, func(i int) bool { return s.buckets[i].ID >= id })
 		if s.buckets[i].ID == id {
@@ -196,8 +197,9 @@ func (a *Aggregator) Add(key Key, counters Counters) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	now := a.now()
+	currentID := coreauth.RecentRequestBucketID(now)
 	s := a.seriesLocked(key)
-	s.add(coreauth.RecentRequestBucketID(now), counters)
+	s.add(currentID, counters, currentID)
 	s.total.add(counters)
 	if a.since.IsZero() {
 		a.since = now
@@ -237,8 +239,9 @@ func (a *Aggregator) makeRoomLocked() {
 		}
 		delete(a.series, oldest)
 		other := a.seriesLocked(otherKey)
+		currentID := coreauth.RecentRequestBucketID(a.now())
 		for _, b := range victim.buckets {
-			other.add(b.ID, b.Counters)
+			other.add(b.ID, b.Counters, currentID)
 		}
 		other.total.add(victim.total)
 	}

@@ -80,14 +80,12 @@ func (a *Aggregator) Open(path string) {
 	currentID := coreauth.RecentRequestBucketID(a.now())
 	for _, fsr := range state.Series {
 		s := a.seriesLocked(Key{Provider: fsr.Provider, Model: fsr.Model, Subagent: fsr.Subagent})
+		// IDs ahead of the clock (file written by a clock running ahead) count in the current bucket.
 		for _, b := range fsr.Buckets {
-			s.add(b.ID, b.Counters)
+			s.add(min(b.ID, currentID), b.Counters, currentID)
 		}
-		s.prune(currentID)
 		s.total.add(fsr.Total)
-		if fsr.LastID > s.lastID {
-			s.lastID = fsr.LastID
-		}
+		s.lastID = max(s.lastID, min(fsr.LastID, currentID))
 	}
 	if !state.Since.IsZero() && (a.since.IsZero() || state.Since.Before(a.since)) {
 		a.since = state.Since
@@ -105,7 +103,9 @@ func (a *Aggregator) Flush() error {
 		return nil
 	}
 	state := fileState{Version: fileVersion, Since: a.since, Series: make([]fileSeries, 0, len(a.series))}
+	currentID := coreauth.RecentRequestBucketID(a.now())
 	for key, s := range a.series {
+		s.prune(currentID) // idle keys get no write that would prune them
 		state.Series = append(state.Series, fileSeries{
 			Provider: key.Provider, Model: key.Model, Subagent: key.Subagent,
 			LastID: s.lastID, Total: s.total, Buckets: s.buckets,
