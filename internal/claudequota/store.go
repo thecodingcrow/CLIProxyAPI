@@ -77,8 +77,6 @@ type Options struct {
 
 // Reader is the read side routing consumes. Every call is memory-only.
 type Reader interface {
-	// HasQuota is Status reduced to (OK, Known).
-	HasQuota(authID, model string) (ok, known bool)
 	// Status judges authID for model by its last good usage and its quota
 	// cooldowns as of the last sync.
 	Status(authID, model string) Status
@@ -115,7 +113,7 @@ func (e *entry) pollable(now time.Time) bool {
 	return !e.cred.Disabled && e.cred.AccessToken != "" && e.rejectedToken == "" && !now.Before(e.nextAt)
 }
 
-// Store caches usage per credential. Snapshot and HasQuota only read memory;
+// Store caches usage per credential. Snapshot and Status only read memory;
 // Tick owns every upstream call: never before one full interval after a
 // credential is first seen, one serial round at a time with spacing, and
 // exponential backoff with jitter after failures.
@@ -351,12 +349,6 @@ func (s *Store) sync(now time.Time, interval time.Duration) {
 			delete(s.entries, id)
 		}
 	}
-}
-
-// HasQuota implements Reader.
-func (s *Store) HasQuota(authID, model string) (ok, known bool) {
-	status := s.Status(authID, model)
-	return status.OK, status.Known
 }
 
 // Status implements Reader.

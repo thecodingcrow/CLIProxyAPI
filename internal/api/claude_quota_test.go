@@ -258,8 +258,8 @@ func TestCredentialsQuotaEndpointServesCachedLimits(t *testing.T) {
 	if sum.Accounts.Total != 2 || sum.Accounts.Disabled != 1 || *sum.WeeklyAllUsedPct != 54.5 || *sum.SessionUsedPct != 15.5 || sum.Scoped["Fable"].RemainingPct != 45.5 {
 		t.Fatalf("summary = %+v, want 2 enabled (1 disabled), weekly 54.5, session 15.5, Fable remaining 45.5", sum)
 	}
-	if ok, known := q.store.HasQuota("exhausted", "claude-fable-5"); ok || !known {
-		t.Fatalf("HasQuota(exhausted, fable) = %v/%v, want false/true", ok, known)
+	if st := q.store.Status("exhausted", "claude-fable-5"); st.OK || !st.Known {
+		t.Fatalf("HasQuota(exhausted, fable) = %v/%v, want false/true", st.OK, st.Known)
 	}
 
 	q.clock.Advance(claudequota.DefaultRefreshInterval - time.Second)
