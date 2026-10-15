@@ -163,7 +163,9 @@ func unifiedHeaders(now time.Time, util5h, util7d, util7dOI, status7dOI string) 
 	if status7dOI == "rejected" {
 		unified = "rejected"
 	}
-	return http.Header{
+	// Lower-case wire names, canonicalised so later Set/Del address the same key.
+	h := http.Header{}
+	for name, values := range map[string][]string{
 		"anthropic-ratelimit-unified-status":               {unified},
 		"anthropic-ratelimit-unified-representative-claim": {"five_hour"},
 		"anthropic-ratelimit-unified-5h-status":            {"allowed"},
@@ -176,7 +178,12 @@ func unifiedHeaders(now time.Time, util5h, util7d, util7dOI, status7dOI string) 
 		"anthropic-ratelimit-unified-7d_oi-utilization":    {util7dOI},
 		"anthropic-ratelimit-unified-7d_oi-reset":          {reset(48 * time.Hour)},
 		"anthropic-ratelimit-unified-reset":                {reset(3 * time.Hour)},
+	} {
+		if values[0] != "" {
+			h[http.CanonicalHeaderKey(name)] = values
+		}
 	}
+	return h
 }
 
 func TestCredentialsQuotaEndpointServesObservedHeaders(t *testing.T) {
@@ -220,9 +227,7 @@ func TestCredentialsQuotaFableRejectionBlocksOnlyFable(t *testing.T) {
 	q.respond("fable-out", "claude-fable-5", unifiedHeaders(q.clock.Now(), "0.10", "0.55", "1.02", "rejected"))
 	// A later unscoped response omits 7d_oi; the Fable model's own snapshot keeps the rejection.
 	later := unifiedHeaders(q.clock.Now(), "0.11", "0.56", "", "")
-	for _, key := range []string{"anthropic-ratelimit-unified-7d_oi-status", "anthropic-ratelimit-unified-7d_oi-utilization", "anthropic-ratelimit-unified-7d_oi-reset"} {
-		later.Del(key)
-	}
+	later.Del("anthropic-ratelimit-unified-7d_oi-reset")
 	q.respond("fable-out", "claude-sonnet-4-5", later)
 
 	store := q.server.claudeQuota
