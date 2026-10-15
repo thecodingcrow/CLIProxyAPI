@@ -36,7 +36,7 @@ func (c *fakeClock) Advance(d time.Duration) {
 
 func newClock() *fakeClock {
 	// Bucket-aligned start keeps advance arithmetic exact.
-	return &fakeClock{now: time.Unix(BucketSeconds*2_900_000, 0)}
+	return &fakeClock{now: time.Unix(BucketSeconds*2_900_000, 0).UTC()}
 }
 
 func record(provider, model string, input, output int64) coreusage.Record {
@@ -66,17 +66,17 @@ func TestSnapshotDropsDataOlderThanWindow(t *testing.T) {
 	agg.HandleUsage(context.Background(), record("claude", "old", 1, 1))
 
 	clock.Advance(time.Duration(BucketSeconds*(bucketCount-2)) * time.Second)
-	if got := findRow(t, agg.Snapshot(), "claude", "old", false); got.Requests != 2 || got.TotalTokens != 17 {
+	if got := findRow(t, agg.Snapshot(RangeWindow), "claude", "old", false); got.Requests != 2 || got.TotalTokens != 17 {
 		t.Fatalf("last in-window bucket: got %+v, want 2 requests / 17 tokens", got)
 	}
 
 	clock.Advance(time.Duration(BucketSeconds) * time.Second)
-	if got := findRow(t, agg.Snapshot(), "claude", "old", false); got.Requests != 1 || got.TotalTokens != 2 {
+	if got := findRow(t, agg.Snapshot(RangeWindow), "claude", "old", false); got.Requests != 1 || got.TotalTokens != 2 {
 		t.Fatalf("after first bucket expired: got %+v, want 1 request / 2 tokens", got)
 	}
 
 	clock.Advance(time.Duration(BucketSeconds) * time.Second)
-	if snap := agg.Snapshot(); len(snap.Models) != 0 {
+	if snap := agg.Snapshot(RangeWindow); len(snap.Models) != 0 {
 		t.Fatalf("after window passed: got %+v, want no rows", snap.Models)
 	}
 }
@@ -87,7 +87,7 @@ func TestBucketReuseAfterFullRotationResetsCounters(t *testing.T) {
 	agg.HandleUsage(context.Background(), record("claude", "m", 100, 0))
 	clock.Advance(time.Duration(BucketSeconds*bucketCount) * time.Second)
 	agg.HandleUsage(context.Background(), record("claude", "m", 1, 0))
-	if got := findRow(t, agg.Snapshot(), "claude", "m", false); got.Requests != 1 || got.InputTokens != 1 {
+	if got := findRow(t, agg.Snapshot(RangeWindow), "claude", "m", false); got.Requests != 1 || got.InputTokens != 1 {
 		t.Fatalf("got %+v, want stale ring slot reset", got)
 	}
 }
@@ -108,7 +108,7 @@ func TestSubagentSplit(t *testing.T) {
 	self.SessionID, self.ParentSessionID = mainSession, mainSession
 	agg.HandleUsage(context.Background(), self)
 
-	snap := agg.Snapshot()
+	snap := agg.Snapshot(RangeWindow)
 	if len(snap.Models) != 2 {
 		t.Fatalf("got %d rows, want main + subagent: %+v", len(snap.Models), snap.Models)
 	}
@@ -130,7 +130,7 @@ func TestFailedCounted(t *testing.T) {
 	failed.Failed = true
 	agg.HandleUsage(context.Background(), failed)
 	agg.HandleUsage(context.Background(), record("codex", "gpt-5", 3, 4))
-	if got := findRow(t, agg.Snapshot(), "codex", "gpt-5", false); got.Requests != 2 || got.Failed != 1 {
+	if got := findRow(t, agg.Snapshot(RangeWindow), "codex", "gpt-5", false); got.Requests != 2 || got.Failed != 1 {
 		t.Fatalf("got %+v, want 2 requests / 1 failed", got)
 	}
 }
@@ -165,7 +165,7 @@ func TestTokensNormalisedAcrossProviders(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			agg := New(newClock().Now, 0)
 			agg.HandleUsage(context.Background(), coreusage.Record{Provider: tc.provider, Model: "m", Detail: tc.detail})
-			got := findRow(t, agg.Snapshot(), tc.provider, "m", false)
+			got := findRow(t, agg.Snapshot(RangeWindow), tc.provider, "m", false)
 			want := Counters{Requests: 1, InputTokens: tc.input, OutputTokens: tc.output, CachedTokens: tc.cached, ReasoningTokens: tc.reasoning, TotalTokens: tc.total}
 			if got.Counters != want {
 				t.Fatalf("got %+v, want %+v", got.Counters, want)
@@ -179,7 +179,7 @@ func TestTokensFallBackToRawWhenUnclassified(t *testing.T) {
 	r := record("", "m", 4, 2)
 	r.Detail.CacheReadTokens = 1
 	agg.HandleUsage(context.Background(), r)
-	got := findRow(t, agg.Snapshot(), "unknown", "m", false)
+	got := findRow(t, agg.Snapshot(RangeWindow), "unknown", "m", false)
 	if got.InputTokens != 4 || got.OutputTokens != 2 || got.CachedTokens != 1 || got.TotalTokens != 6 {
 		t.Fatalf("got %+v, want raw fields", got.Counters)
 	}
@@ -190,36 +190,41 @@ func TestProviderMatchesAPIKeyGrouping(t *testing.T) {
 	agg.HandleUsage(context.Background(), record("openai-compatible-OpenRouter", "kimi", 1, 1))
 	agg.HandleUsage(context.Background(), record(" Claude ", "opus", 1, 1))
 	agg.HandleUsage(context.Background(), record("", "x", 1, 1))
-	snap := agg.Snapshot()
+	snap := agg.Snapshot(RangeWindow)
 	findRow(t, snap, "openrouter", "kimi", false)
 	findRow(t, snap, "claude", "opus", false)
 	findRow(t, snap, "unknown", "x", false)
 }
 
-func TestKeyCapEvictsLeastRecentlyActive(t *testing.T) {
+func TestKeyCapFoldsLeastRecentlyActiveIntoOther(t *testing.T) {
 	clock := newClock()
 	agg := New(clock.Now, 2)
 	agg.HandleUsage(context.Background(), record("claude", "a", 1, 0))
 	clock.Advance(time.Duration(BucketSeconds) * time.Second)
-	agg.HandleUsage(context.Background(), record("claude", "b", 1, 0))
+	agg.HandleUsage(context.Background(), record("claude", "b", 7, 0))
 	clock.Advance(time.Duration(BucketSeconds) * time.Second)
 	agg.HandleUsage(context.Background(), record("claude", "a", 1, 0)) // refreshes a
 	agg.HandleUsage(context.Background(), record("claude", "c", 1, 0)) // evicts b
 
-	snap := agg.Snapshot()
-	if len(snap.Models) != 2 {
-		t.Fatalf("got %d rows, want 2: %+v", len(snap.Models), snap.Models)
-	}
-	for _, row := range snap.Models {
-		if row.Model == "b" {
-			t.Fatalf("least recently active key b survived: %+v", snap.Models)
+	for _, r := range []Range{RangeWindow, RangeTotal} {
+		snap := agg.Snapshot(r)
+		if len(snap.Models) != 3 {
+			t.Fatalf("%s: got %d rows, want a, c, other: %+v", r, len(snap.Models), snap.Models)
+		}
+		for _, row := range snap.Models {
+			if row.Model == "b" {
+				t.Fatalf("%s: least recently active key b survived: %+v", r, snap.Models)
+			}
+		}
+		if got := findRow(t, snap, OtherName, OtherName, false); got.Requests != 1 || got.InputTokens != 7 {
+			t.Fatalf("%s: other row %+v, want b's counters", r, got)
 		}
 	}
 }
 
 func TestSnapshotJSONContract(t *testing.T) {
 	agg := New(newClock().Now, 0)
-	raw, err := json.Marshal(agg.Snapshot())
+	raw, err := json.Marshal(agg.Snapshot(RangeWindow))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -227,8 +232,15 @@ func TestSnapshotJSONContract(t *testing.T) {
 	if err := json.Unmarshal(raw, &got); err != nil {
 		t.Fatal(err)
 	}
-	if got["bucket_seconds"] != float64(600) || got["window_minutes"] != float64(200) {
+	if got["bucket_seconds"] != float64(600) || got["window_minutes"] != float64(200) || got["range"] != "window" {
 		t.Fatalf("window fields: %s", raw)
+	}
+	if got["timezone"] != "UTC" {
+		t.Fatalf("timezone: %s", raw)
+	}
+	since, err := time.Parse(time.RFC3339, got["since"].(string))
+	if err != nil || !since.Equal(newClock().Now().Add(-200*time.Minute)) {
+		t.Fatalf("since: %v %s", err, raw)
 	}
 	if _, err := time.Parse(time.RFC3339, got["generated_at"].(string)); err != nil {
 		t.Fatalf("generated_at: %v", err)
@@ -259,12 +271,12 @@ func TestConcurrentHandleUsageAndSnapshot(t *testing.T) {
 		go func() {
 			defer wg.Done()
 			for i := 0; i < 100; i++ {
-				_ = agg.Snapshot()
+				_ = agg.Snapshot(RangeWindow)
 			}
 		}()
 	}
 	wg.Wait()
-	if n := len(agg.Snapshot().Models); n == 0 || n > 16 {
-		t.Fatalf("rows = %d, want 1..16 (key cap)", n)
+	if n := len(agg.Snapshot(RangeWindow).Models); n == 0 || n > 17 {
+		t.Fatalf("rows = %d, want 1..17 (key cap + other)", n)
 	}
 }

@@ -6,7 +6,9 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
+	"time"
 
 	"github.com/gin-gonic/gin"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/api/handlers/management"
@@ -37,8 +39,8 @@ func TestManagementV8ModelUsageRoute(t *testing.T) {
 	modelusage.Default().Add(modelusage.Key{Provider: provider, Model: "m"},
 		modelusage.Counters{Requests: 2, Failed: 1, TotalTokens: 3})
 
-	get := func(authorized bool) *httptest.ResponseRecorder {
-		req := httptest.NewRequest(http.MethodGet, "/v8/management/observability/usage/models", nil)
+	get := func(authorized bool, query string) *httptest.ResponseRecorder {
+		req := httptest.NewRequest(http.MethodGet, "/v8/management/observability/usage/models"+query, nil)
 		req.RemoteAddr = "127.0.0.1:1234"
 		if authorized {
 			req.Header.Set("Authorization", "Bearer test-password")
@@ -48,14 +50,31 @@ func TestManagementV8ModelUsageRoute(t *testing.T) {
 		return rec
 	}
 
-	if rec := get(false); rec.Code != http.StatusUnauthorized {
+	if rec := get(false, ""); rec.Code != http.StatusUnauthorized {
 		t.Fatalf("missing key: status=%d body=%s", rec.Code, rec.Body.String())
 	}
-	rec := get(true)
+	if rec := get(true, "?range=week"); rec.Code != http.StatusBadRequest || !strings.Contains(rec.Body.String(), `"error"`) {
+		t.Fatalf("invalid range: status=%d body=%s", rec.Code, rec.Body.String())
+	}
+
+	for _, tc := range []struct{ query, wantRange string }{
+		{"", "window"}, {"?range=window", "window"}, {"?range=today", "today"}, {"?range=7d", "7d"}, {"?range=total", "total"},
+	} {
+		t.Run("range "+tc.wantRange+tc.query, func(t *testing.T) {
+			checkModelUsageResponse(t, get(true, tc.query), provider, tc.wantRange)
+		})
+	}
+}
+
+func checkModelUsageResponse(t *testing.T, rec *httptest.ResponseRecorder, provider, wantRange string) {
+	t.Helper()
 	if rec.Code != http.StatusOK {
 		t.Fatalf("status=%d body=%s", rec.Code, rec.Body.String())
 	}
 	var body struct {
+		Range         string `json:"range"`
+		Since         string `json:"since"`
+		Timezone      string `json:"timezone"`
 		BucketSeconds int64  `json:"bucket_seconds"`
 		WindowMinutes int64  `json:"window_minutes"`
 		GeneratedAt   string `json:"generated_at"`
@@ -72,8 +91,19 @@ func TestManagementV8ModelUsageRoute(t *testing.T) {
 	if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
 		t.Fatalf("decode: %v body=%s", err, rec.Body.String())
 	}
-	if body.BucketSeconds != 600 || body.WindowMinutes != 200 || body.GeneratedAt == "" {
+	if body.BucketSeconds != 600 || body.GeneratedAt == "" || body.Range != wantRange || body.Timezone == "" {
 		t.Fatalf("envelope: %s", rec.Body.String())
+	}
+	since, errSince := time.Parse(time.RFC3339, body.Since)
+	if errSince != nil {
+		t.Fatalf("since: %v body=%s", errSince, rec.Body.String())
+	}
+	if wantMinutes := map[string]int64{"window": 200, "7d": 7 * 24 * 60}[wantRange]; wantMinutes != 0 && body.WindowMinutes != wantMinutes {
+		t.Fatalf("window_minutes %d, want %d", body.WindowMinutes, wantMinutes)
+	}
+	// One minute of slack: the handler's clock read precedes this one.
+	if got := int64(time.Since(since).Round(time.Minute) / time.Minute); got < body.WindowMinutes || got > body.WindowMinutes+1 {
+		t.Fatalf("window_minutes %d does not span since %s", body.WindowMinutes, body.Since)
 	}
 	var rows []int
 	for i, m := range body.Models {
