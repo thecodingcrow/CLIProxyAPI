@@ -98,7 +98,7 @@ func TestStatusFromObservedWindows(t *testing.T) {
 		id, model string
 		want      Status
 	}{
-		{"healthy", "claude-fable-5", Status{Known: true, OK: true}},
+		{"healthy", "claude-fable-5", Status{Known: true, OK: true, HeadroomPct: 91, DrainBy: weeklyReset}},
 		{"exhausted", "claude-fable-5", Status{Known: true, ResetAt: weeklyReset}},
 		{"exhausted", "claude-sonnet-4-5", Status{Known: true, ResetAt: weeklyReset}},
 		{"pending", "claude-fable-5", Status{OK: true}},
@@ -109,11 +109,36 @@ func TestStatusFromObservedWindows(t *testing.T) {
 		}
 	}
 	afterReset := newTestStore(weeklyReset, healthy, exhausted)
-	if got := afterReset.Status("exhausted", "claude-sonnet-4-5"); got != (Status{Known: true, OK: true}) {
-		t.Fatalf("Status past the weekly reset = %+v, want known and available", got)
+	// Every window ended: full headroom, next reset unknown.
+	if got := afterReset.Status("exhausted", "claude-sonnet-4-5"); got != (Status{Known: true, OK: true, HeadroomPct: 100}) {
+		t.Fatalf("Status past the weekly reset = %+v, want known, available, full headroom, no drain-by", got)
 	}
 	if !accountByID(t, afterReset.Snapshot(), "exhausted").Stale {
 		t.Fatal("account past its weekly reset not marked stale")
+	}
+}
+
+func TestStatusHeadroomFollowsTheWeeklyWindowWithLeastLeft(t *testing.T) {
+	h := withWindow(http.Header{}, "5h", "allowed", "0.95", sessionReset)
+	withWindow(h, "7d", "allowed", "0.30", weeklyReset)
+	withWindow(h, "7d_oi", "allowed", "0.60", fableReset)
+	scoped := Credential{ID: "scoped", Observations: []Observation{observe(t, h, observedNow)}}
+	n := withWindow(http.Header{}, "7d", "allowed", "0.20", time.Time{})
+	noReset := Credential{ID: "no-reset", Observations: []Observation{observe(t, n, observedNow)}}
+	store := newTestStore(observedNow, scoped, noReset)
+
+	for _, tc := range []struct {
+		id, model string
+		want      Status
+	}{
+		// Session usage gates availability only; it never lowers headroom.
+		{"scoped", "claude-fable-5", Status{Known: true, OK: true, HeadroomPct: 40, DrainBy: fableReset}},
+		{"scoped", "claude-sonnet-4-5", Status{Known: true, OK: true, HeadroomPct: 70, DrainBy: weeklyReset}},
+		{"no-reset", "claude-sonnet-4-5", Status{Known: true, OK: true, HeadroomPct: 80}},
+	} {
+		if got := store.Status(tc.id, tc.model); got != tc.want {
+			t.Errorf("Status(%s, %s) = %+v, want %+v", tc.id, tc.model, got, tc.want)
+		}
 	}
 }
 

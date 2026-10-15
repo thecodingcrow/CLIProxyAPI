@@ -206,6 +206,35 @@ func (u *Usage) blockedUntil(model string, now time.Time) (blocked bool, until t
 	return blocked, until
 }
 
+// headroom is the percent left for model in the weekly window that caps it
+// (weekly_all, or a matching scoped one using more) and that window's reset;
+// zero reset when unreported or already passed. The 5h session only gates.
+func (u *Usage) headroom(model string, now time.Time) (float64, time.Time) {
+	used := func(l *Limit) float64 {
+		if l == nil {
+			return 0
+		}
+		return l.usedPercent(now)
+	}
+	drainBy := func(l *Limit) time.Time {
+		if l == nil || l.ResetsAt == nil || l.outlived(now) {
+			return time.Time{}
+		}
+		return *l.ResetsAt
+	}
+	binding := u.WeeklyAll
+	for name, limit := range u.Scoped {
+		if !ScopeMatchesModel(name, model) {
+			continue
+		}
+		// Equal headroom: the later reset caps usable quota longer.
+		if used(&limit) > used(binding) || (used(&limit) == used(binding) && drainBy(&limit).After(drainBy(binding))) {
+			binding = &limit
+		}
+	}
+	return math.Max(0, exhaustedPercent-used(binding)), drainBy(binding)
+}
+
 // ScopeMatchesModel reports whether a scoped limit's display name names model:
 // case-insensitive, either equal or present as whole '-'-separated tokens
 // ("Nimbus Max" matches "claude-nimbus-max-2"; "Opus 4" does not match "claude-opus-45").

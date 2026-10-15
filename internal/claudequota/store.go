@@ -44,6 +44,11 @@ type Status struct {
 	// ResetAt is when the last window or cooldown blocking the model ends; zero
 	// when OK or when a blocking window reports no reset time.
 	ResetAt time.Time
+	// HeadroomPct is the percent left in the weekly window that caps the
+	// model; set only when Known and OK.
+	HeadroomPct float64
+	// DrainBy is when that capping window resets; zero when unreported.
+	DrainBy time.Time
 }
 
 // Store derives quota from the headers each credential already carries; it
@@ -84,7 +89,8 @@ func (s *Store) Status(authID, model string) Status {
 		blocked = true
 	}
 	if !blocked {
-		return Status{Known: true, OK: true}
+		headroom, drainBy := usage.headroom(model, now)
+		return Status{Known: true, OK: true, HeadroomPct: headroom, DrainBy: drainBy}
 	}
 	return Status{Known: true, ResetAt: until}
 }
