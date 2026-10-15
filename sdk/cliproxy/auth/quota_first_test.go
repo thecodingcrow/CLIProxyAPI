@@ -194,6 +194,64 @@ func TestQuotaFirstRanksUnknownWithHealthyAndAboveExhausted(t *testing.T) {
 	assertSequence(t, "picks once the healthy one is exhausted", h.picks(2), "qf-mix-b-unknown", "qf-mix-b-unknown")
 }
 
+// quotaLeft is a known-good status; resets are offsets from one now so picks
+// compare them against the same wall clock within hours of margin.
+func quotaLeft(headroom float64, drainBy time.Time) QuotaStatus {
+	return QuotaStatus{Known: true, Available: true, HeadroomPct: headroom, DrainBy: drainBy}
+}
+
+func TestQuotaFirstDrainsTheCredentialWithMoreHeadroomFirst(t *testing.T) {
+	reset := time.Now().Add(72 * time.Hour)
+	quota := &fakeQuota{}
+	quota.set("qf-drain-a", quotaLeft(30, reset))
+	quota.set("qf-drain-b", quotaLeft(80, reset))
+	h := newQuotaFirstHarness(t, "qf-drain", &QuotaFirstSelector{}, quota, "qf-drain-a", "qf-drain-b")
+
+	assertSequence(t, "picks at 30 vs 80", h.picks(3), "qf-drain-b", "qf-drain-b", "qf-drain-b")
+	quota.set("qf-drain-b", quotaLeft(29, reset))
+	assertSequence(t, "picks once b falls below a", h.picks(2), "qf-drain-a", "qf-drain-a")
+	quota.set("qf-drain-b", quotaLeft(30, reset))
+	assertSequence(t, "picks at equal headroom", h.picks(2), "qf-drain-b", "qf-drain-a")
+}
+
+func TestQuotaFirstDrainsTheSoonerResetFirst(t *testing.T) {
+	monday := time.Now() // read as Monday 12:00
+	tuesday, thursday := monday.Add(24*time.Hour), monday.Add(74*time.Hour)
+	quota := &fakeQuota{}
+	quota.set("qf-reset-a-thu", quotaLeft(50, thursday))
+	quota.set("qf-reset-b-tue", quotaLeft(50, tuesday))
+	h := newQuotaFirstHarness(t, "qf-reset", &QuotaFirstSelector{}, quota, "qf-reset-a-thu", "qf-reset-b-tue")
+
+	assertSequence(t, "picks at equal headroom", h.picks(2), "qf-reset-b-tue", "qf-reset-b-tue")
+	// 5/24h is less pressure than 90/74h: a nearly drained account does not
+	// outrank one with far more to spend before its own reset.
+	quota.set("qf-reset-a-thu", quotaLeft(90, thursday))
+	quota.set("qf-reset-b-tue", quotaLeft(5, tuesday))
+	assertSequence(t, "picks at Tue 5 vs Thu 90", h.picks(2), "qf-reset-a-thu", "qf-reset-a-thu")
+}
+
+func TestQuotaFirstTreatsAnUnreportedResetAsAWeekAway(t *testing.T) {
+	now := time.Now()
+	quota := &fakeQuota{}
+	quota.set("qf-horizon-a-unreported", quotaLeft(50, time.Time{}))
+	quota.set("qf-horizon-b", quotaLeft(50, now.Add(24*time.Hour)))
+	h := newQuotaFirstHarness(t, "qf-horizon", &QuotaFirstSelector{}, quota, "qf-horizon-a-unreported", "qf-horizon-b")
+
+	assertSequence(t, "picks against a reset in a day", h.picks(2), "qf-horizon-b", "qf-horizon-b")
+	quota.set("qf-horizon-b", quotaLeft(50, now.Add(200*time.Hour)))
+	assertSequence(t, "picks against a reset past a week", h.picks(2), "qf-horizon-a-unreported", "qf-horizon-a-unreported")
+}
+
+func TestQuotaFirstSharesTheTopTierWithAnUnknownCredential(t *testing.T) {
+	reset := time.Now().Add(72 * time.Hour)
+	quota := &fakeQuota{}
+	quota.set("qf-probe-a", quotaLeft(80, reset))
+	quota.set("qf-probe-b", quotaLeft(30, reset))
+	h := newQuotaFirstHarness(t, "qf-probe", &QuotaFirstSelector{}, quota, "qf-probe-a", "qf-probe-b", "qf-probe-c-unknown")
+
+	assertSequence(t, "picks", h.picks(4), "qf-probe-a", "qf-probe-c-unknown", "qf-probe-a", "qf-probe-c-unknown")
+}
+
 func TestQuotaFirstUnderSessionAffinityKeepsBindingAndRebindsByQuota(t *testing.T) {
 	quota := &fakeQuota{}
 	for _, id := range []string{"qf-aff-a", "qf-aff-b", "qf-aff-c"} {
@@ -212,10 +270,11 @@ func TestQuotaFirstUnderSessionAffinityKeepsBindingAndRebindsByQuota(t *testing.
 		t.Fatalf("bound credential once its quota data says exhausted = %q, want binding kept", got)
 	}
 
-	quota.set("qf-aff-b", quotaExhausted(quotaResetNext))
+	quota.set("qf-aff-b", quotaLeft(20, quotaResetLate))
+	quota.set("qf-aff-c", quotaLeft(70, quotaResetLate))
 	h.quotaExceeded("qf-aff-a")
 	if got := h.pick(session, nil); got != "qf-aff-c" {
-		t.Fatalf("rebinding after the bound credential cooled down = %q, want the one with quota", got)
+		t.Fatalf("rebinding after the bound credential cooled down = %q, want the one with most headroom", got)
 	}
 	if got := h.pick(session, nil); got != "qf-aff-c" {
 		t.Fatalf("pick after rebinding = %q, want the new binding kept", got)

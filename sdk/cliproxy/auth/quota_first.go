@@ -2,6 +2,7 @@ package auth
 
 import (
 	"context"
+	"math"
 	"time"
 
 	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/executor"
@@ -17,6 +18,11 @@ type QuotaStatus struct {
 	// ResetAt is when an unavailable credential can serve the model again;
 	// zero when unreported.
 	ResetAt time.Time
+	// HeadroomPct is the percent left in the window that caps the model;
+	// meaningful only when Known and Available.
+	HeadroomPct float64
+	// DrainBy is when that window resets; zero when unreported.
+	DrainBy time.Time
 }
 
 // QuotaProvider reports cached plan-limit standing. Implementations answer
@@ -69,10 +75,16 @@ func ranksByQuota(selector Selector) bool {
 	}
 }
 
-// QuotaFirstSelector is round-robin over the credentials still worth sending
-// to: those with plan quota for the model or without quota data. When every
-// candidate is known exhausted it picks the one whose block ends soonest.
-// Without a quota lookup it is plain round-robin.
+// drainHorizon stands in for an unreported reset: far enough that the
+// credential neither starves nor outranks those with a reset due.
+const drainHorizon = 7 * 24 * time.Hour
+
+// QuotaFirstSelector drains credentials so none leaves quota unused at its
+// reset. Among those with quota for the model it picks the highest pressure,
+// headroom per hour until the capping window resets (at least one hour):
+// equal resets favour more headroom, a sooner reset drains first. Ties
+// round-robin. When every candidate is known exhausted it picks the one whose
+// block ends soonest. Without a quota lookup it is plain round-robin.
 type QuotaFirstSelector struct {
 	rr RoundRobinSelector
 }
@@ -80,42 +92,63 @@ type QuotaFirstSelector struct {
 // Pick implements Selector.
 func (s *QuotaFirstSelector) Pick(ctx context.Context, provider, model string, opts cliproxyexecutor.Options, auths []*Auth) (*Auth, error) {
 	_ = opts
-	available, err := getSelectorAvailableAuths(ctx, auths, provider, model, time.Now())
+	now := time.Now()
+	available, err := getSelectorAvailableAuths(ctx, auths, provider, model, now)
 	if err != nil {
 		return nil, err
 	}
 	available = preferCodexWebsocketAuths(ctx, provider, available)
 	if ctx != nil {
 		if lookup, _ := ctx.Value(quotaLookupKey{}).(quotaLookup); lookup != nil {
-			available = quotaPreferredAuths(available, lookup)
+			available = quotaPreferredAuths(available, lookup, now)
 		}
 	}
 	return s.rr.next(provider+":"+canonicalModelKey(model), available), nil
 }
 
+// drainPressure is headroom per hour left before the capping window resets.
+func drainPressure(status QuotaStatus, now time.Time) float64 {
+	left := drainHorizon
+	if !status.DrainBy.IsZero() {
+		left = status.DrainBy.Sub(now)
+	}
+	return status.HeadroomPct / math.Max(left.Hours(), 1)
+}
+
 // quotaPreferredAuths narrows candidates to their best quota tier, keeping
-// order so rotation continues within it. Unknown ranks with available because
-// missing data must never starve a credential.
-func quotaPreferredAuths(available []*Auth, lookup quotaLookup) []*Auth {
+// order so rotation continues within it. Unknown credentials join the top
+// pressure tier: their first response reports their quota, so ranking them
+// lower would starve them of the traffic that makes them known.
+func quotaPreferredAuths(available []*Auth, lookup quotaLookup, now time.Time) []*Auth {
+	statuses := make([]QuotaStatus, len(available))
+	pressures := make([]float64, len(available))
+	best, anyPreferred := math.Inf(-1), false
+	for i, auth := range available {
+		statuses[i] = lookup(auth)
+		switch {
+		case !statuses[i].Known:
+			anyPreferred = true
+		case statuses[i].Available:
+			anyPreferred = true
+			pressures[i] = drainPressure(statuses[i], now)
+			best = math.Max(best, pressures[i])
+		}
+	}
 	var preferred, soonest []*Auth
 	var soonestAt time.Time
-	for _, auth := range available {
-		status := lookup(auth)
-		if !status.Known || status.Available {
-			preferred = append(preferred, auth)
-			continue
-		}
-		if len(preferred) > 0 {
-			continue
-		}
+	for i, auth := range available {
+		status := statuses[i]
 		switch {
+		case !status.Known || (status.Available && pressures[i] == best):
+			preferred = append(preferred, auth)
+		case anyPreferred || status.Available: // outranked
 		case len(soonest) == 0 || resetsEarlier(status.ResetAt, soonestAt):
 			soonest, soonestAt = []*Auth{auth}, status.ResetAt
 		case status.ResetAt.Equal(soonestAt):
 			soonest = append(soonest, auth)
 		}
 	}
-	if len(preferred) > 0 {
+	if anyPreferred {
 		return preferred
 	}
 	return soonest
