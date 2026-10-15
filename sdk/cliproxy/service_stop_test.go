@@ -14,6 +14,7 @@ import (
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/api"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/config"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/modelusage"
+	"github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/usage"
 )
 
 func TestServiceShutdown_ViolentShutdownImmediatelyClosesServer(t *testing.T) {
@@ -82,6 +83,9 @@ func TestServiceShutdown_ViolentShutdownImmediatelyClosesServer(t *testing.T) {
 }
 
 func TestServiceRun_ShutdownContextFreshAtExit(t *testing.T) {
+	// Model usage must land next to the config, not in an inherited WRITABLE_PATH.
+	t.Setenv("WRITABLE_PATH", "")
+	t.Setenv("writable_path", "")
 	ln, errListen := net.Listen("tcp", "127.0.0.1:0")
 	if errListen != nil {
 		t.Fatalf("failed to listen: %v", errListen)
@@ -135,7 +139,7 @@ func TestServiceRun_ShutdownContextFreshAtExit(t *testing.T) {
 	if errCloseConn := conn.Close(); errCloseConn != nil {
 		t.Logf("connection close error: %v", errCloseConn)
 	}
-	modelusage.Default().Add(modelusage.Key{Provider: "stop-test", Model: "m"}, modelusage.Counters{Requests: 1})
+	usage.PublishRecord(context.Background(), usage.Record{Provider: "stop-test", Model: "m"})
 
 	// Trigger stop.
 	stopStart := time.Now()

@@ -409,14 +409,16 @@ type queueItem struct {
 
 // Manager maintains a queue of usage records and delivers them to registered plugins.
 type Manager struct {
-	once     sync.Once
-	stopOnce sync.Once
-	cancel   context.CancelFunc
+	lifeMu  sync.Mutex
+	started bool // Publish auto-starts only a never-started manager; a stopped one drops records
+	cancel  context.CancelFunc
+	done    chan struct{} // closed once the current dispatcher has drained the queue and exited
 
 	mu     sync.Mutex
 	cond   *sync.Cond
 	queue  []queueItem
 	closed bool
+	gen    uint64 // dispatcher generation; an older dispatcher exits once a restart supersedes it
 
 	pluginsMu sync.RWMutex
 	plugins   []Plugin
@@ -430,35 +432,79 @@ func NewManager(buffer int) *Manager {
 	return m
 }
 
-// Start launches the background dispatcher. Calling Start multiple times is safe.
+// Start launches the background dispatcher; a no-op while running, a restart after Stop.
 func (m *Manager) Start(ctx context.Context) {
 	if m == nil {
 		return
 	}
-	m.once.Do(func() {
-		if ctx == nil {
-			ctx = context.Background()
-		}
-		var workerCtx context.Context
-		workerCtx, m.cancel = context.WithCancel(ctx)
-		go m.run(workerCtx)
-	})
+	m.lifeMu.Lock()
+	defer m.lifeMu.Unlock()
+	m.startLocked(ctx)
 }
 
-// Stop stops the dispatcher and drains the queue.
+func (m *Manager) startLocked(ctx context.Context) {
+	if m.cancel != nil {
+		return
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	m.started = true
+	var workerCtx context.Context
+	workerCtx, m.cancel = context.WithCancel(ctx)
+	done := make(chan struct{})
+	m.done = done
+	m.mu.Lock()
+	m.closed = false
+	m.gen++
+	gen := m.gen
+	m.mu.Unlock()
+	m.cond.Broadcast()
+	go func() {
+		defer close(done)
+		m.run(workerCtx, gen)
+	}()
+}
+
+// Stop closes the queue; the dispatcher drains what is queued in the background. Shutdown waits for that.
 func (m *Manager) Stop() {
 	if m == nil {
 		return
 	}
-	m.stopOnce.Do(func() {
-		if m.cancel != nil {
-			m.cancel()
-		}
-		m.mu.Lock()
-		m.closed = true
-		m.mu.Unlock()
-		m.cond.Broadcast()
-	})
+	m.lifeMu.Lock()
+	defer m.lifeMu.Unlock()
+	if m.cancel == nil {
+		return
+	}
+	m.cancel()
+	m.cancel = nil
+	m.mu.Lock()
+	m.closed = true
+	m.mu.Unlock()
+	m.cond.Broadcast()
+}
+
+// Shutdown stops the manager and waits until every queued record reached the plugins, or ctx ends.
+func (m *Manager) Shutdown(ctx context.Context) error {
+	if m == nil {
+		return nil
+	}
+	m.Stop()
+	m.lifeMu.Lock()
+	done := m.done
+	m.lifeMu.Unlock()
+	if done == nil {
+		return nil
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	select {
+	case <-done:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
 }
 
 // Register appends a plugin to the delivery list.
@@ -533,7 +579,11 @@ func (m *Manager) Publish(ctx context.Context, record Record) {
 		}
 	}
 	// ensure worker is running even if Start was not called explicitly
-	m.Start(context.Background())
+	m.lifeMu.Lock()
+	if !m.started {
+		m.startLocked(context.Background())
+	}
+	m.lifeMu.Unlock()
 	m.mu.Lock()
 	if m.closed {
 		m.mu.Unlock()
@@ -544,13 +594,13 @@ func (m *Manager) Publish(ctx context.Context, record Record) {
 	m.cond.Signal()
 }
 
-func (m *Manager) run(ctx context.Context) {
+func (m *Manager) run(ctx context.Context, gen uint64) {
 	for {
 		m.mu.Lock()
-		for !m.closed && len(m.queue) == 0 {
+		for !m.closed && m.gen == gen && len(m.queue) == 0 {
 			m.cond.Wait()
 		}
-		if len(m.queue) == 0 && m.closed {
+		if m.gen != gen || (len(m.queue) == 0 && m.closed) {
 			m.mu.Unlock()
 			return
 		}
@@ -605,3 +655,6 @@ func StartDefault(ctx context.Context) { DefaultManager().Start(ctx) }
 
 // StopDefault stops the default manager's dispatcher.
 func StopDefault() { DefaultManager().Stop() }
+
+// ShutdownDefault stops the default manager and waits for its queue to drain, or ctx to end.
+func ShutdownDefault(ctx context.Context) error { return DefaultManager().Shutdown(ctx) }

@@ -391,8 +391,10 @@ func (s *Service) Shutdown(ctx context.Context) error {
 			}
 		}
 
-		usage.StopDefault()
-		// Last: the API server is stopped, so no further usage arrives after this flush.
+		// Drain queued usage before the final flush so late records reach the file.
+		if errDrain := usage.ShutdownDefault(ctx); errDrain != nil {
+			log.Warnf("usage queue not drained before shutdown: %v", errDrain)
+		}
 		modelusage.Default().StopPersistence()
 	})
 	return shutdownErr
