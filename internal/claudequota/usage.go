@@ -222,13 +222,17 @@ func (u *Usage) headroom(model string, now time.Time) (float64, time.Time) {
 		}
 		return *l.ResetsAt
 	}
+	// resetsLater counts an unreported reset as latest, as routing does.
+	resetsLater := func(a, b time.Time) bool {
+		return !b.IsZero() && (a.IsZero() || a.After(b))
+	}
 	binding := u.WeeklyAll
 	for name, limit := range u.Scoped {
 		if !ScopeMatchesModel(name, model) {
 			continue
 		}
 		// Equal headroom: the later reset caps usable quota longer.
-		if used(&limit) > used(binding) || (used(&limit) == used(binding) && drainBy(&limit).After(drainBy(binding))) {
+		if binding == nil || used(&limit) > used(binding) || (used(&limit) == used(binding) && resetsLater(drainBy(&limit), drainBy(binding))) {
 			binding = &limit
 		}
 	}
