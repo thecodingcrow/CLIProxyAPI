@@ -11,7 +11,7 @@ import (
 
 // attachClaudeQuota derives plan limits from the quota headers the auth
 // manager stores per credential and hands them to the management endpoint
-// and to quota-first routing. A nil now uses the wall clock.
+// and to quota-first routing.
 func (s *Server) attachClaudeQuota(manager *auth.Manager, now func() time.Time) {
 	s.claudeQuota = claudequota.NewStore(
 		func() []claudequota.Credential {

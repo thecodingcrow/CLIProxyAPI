@@ -247,9 +247,12 @@ func TestCredentialsQuotaFableRejectionBlocksOnlyFable(t *testing.T) {
 func TestCredentialsQuotaWindowPastItsResetIsNotExhausted(t *testing.T) {
 	guardExternalDials(t)
 	q := newQuotaTestServer(t, true)
-	h := unifiedHeaders(q.clock.Now(), "0.10", "1.0", "0.40", "allowed")
+	h := unifiedHeaders(q.clock.Now(), "0.80", "1.0", "0.40", "allowed")
 	h.Set("anthropic-ratelimit-unified-7d-status", "rejected")
-	h.Set("anthropic-ratelimit-unified-7d-reset", strconv.FormatInt(q.clock.Now().Add(time.Hour).Unix(), 10))
+	inAnHour := strconv.FormatInt(q.clock.Now().Add(time.Hour).Unix(), 10)
+	for _, window := range []string{"5h", "7d", "7d_oi"} {
+		h.Set("anthropic-ratelimit-unified-"+window+"-reset", inAnHour)
+	}
 	q.respond("healthy", "claude-sonnet-4-5", h)
 	if st := q.server.claudeQuota.Status("healthy", "claude-sonnet-4-5"); st.OK {
 		t.Fatalf("Status before the 7d reset = %+v, want blocked", st)
@@ -260,8 +263,14 @@ func TestCredentialsQuotaWindowPastItsResetIsNotExhausted(t *testing.T) {
 		t.Fatalf("Status after the 7d reset = %+v, want known and available", st)
 	}
 	_, snap, _ := q.get(t, "test-password")
-	if account := snapshotAccount(t, snap, "healthy"); !account.Stale || !account.HasQuota.Any {
-		t.Fatalf("account = %+v, want stale but with quota", account)
+	account := snapshotAccount(t, snap, "healthy")
+	if !account.Stale || !account.HasQuota.Any || account.WeeklyAll.Percent != 100 {
+		t.Fatalf("account = %+v, want stale, with quota, raw weekly 100 kept", account)
+	}
+	// Reset windows count as 0% used in the summary.
+	sum := snap.Summary
+	if *sum.WeeklyAllUsedPct != 0 || *sum.SessionUsedPct != 0 || sum.Scoped["Fable"].UsedPct != 0 || sum.Scoped["Fable"].RemainingPct != 100 {
+		t.Fatalf("summary = %+v, Fable %+v, want weekly 0, session 0, Fable used 0 remaining 100", sum, sum.Scoped["Fable"])
 	}
 }
 

@@ -160,17 +160,19 @@ func summarize(accounts []Account, now time.Time) Summary {
 		if account.HasQuota.Any {
 			summary.Accounts.WithQuotaAny++
 		}
+		// Ended windows count as 0%; the account keeps the raw reading and stale.
 		weeklyPct := 0.0
 		if account.WeeklyAll != nil {
-			weeklyPct = account.WeeklyAll.Percent
+			weeklyPct = account.WeeklyAll.usedPercent(now)
 			weekly = append(weekly, weeklyPct)
 		}
 		if account.Session != nil {
-			session = append(session, account.Session.Percent)
+			session = append(session, account.Session.usedPercent(now))
 		}
 		for name, limit := range account.WeeklyScoped {
-			scopedUsed[name] = append(scopedUsed[name], limit.Percent)
-			scopedRemaining[name] = append(scopedRemaining[name], math.Max(0, 100-math.Max(limit.Percent, weeklyPct)))
+			used := limit.usedPercent(now)
+			scopedUsed[name] = append(scopedUsed[name], used)
+			scopedRemaining[name] = append(scopedRemaining[name], math.Max(0, 100-math.Max(used, weeklyPct)))
 		}
 		for _, limit := range accountLimits(account) {
 			if limit.ResetsAt != nil && limit.ResetsAt.After(now) && (summary.SoonestReset == nil || limit.ResetsAt.Before(*summary.SoonestReset)) {

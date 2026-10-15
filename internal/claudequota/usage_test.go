@@ -160,6 +160,27 @@ func TestUsageFromTakesEachWindowFromItsNewestObservation(t *testing.T) {
 	}
 }
 
+func TestRejectedWindowWithoutResetExpiresAfterItsLength(t *testing.T) {
+	usage := UsageFrom([]Observation{observe(t, http.Header{
+		"Anthropic-Ratelimit-Unified-5h-Status":    {"rejected"},
+		"Anthropic-Ratelimit-Unified-7d_oi-Status": {"rejected"},
+	}, observedNow)})
+	for _, tc := range []struct {
+		model  string
+		length time.Duration
+	}{{"claude-sonnet-4-5", 5 * time.Hour}, {"claude-fable-5", 7 * 24 * time.Hour}} {
+		if usage.HasQuota(tc.model, observedNow.Add(tc.length-time.Second)) {
+			t.Errorf("HasQuota(%s) inside the window = true, want blocked", tc.model)
+		}
+		if !usage.HasQuota(tc.model, observedNow.Add(tc.length)) {
+			t.Errorf("HasQuota(%s) one window after observation = false, want reset", tc.model)
+		}
+	}
+	if !usage.stale(observedNow.Add(5 * time.Hour)) {
+		t.Fatal("not stale once the 5h reading outlived its window")
+	}
+}
+
 func TestUsageStaleOnceAWindowOutlivesItsReset(t *testing.T) {
 	usage := UsageFrom([]Observation{observe(t, recordedAllowed(), observedNow)})
 	if usage.stale(sessionReset.Add(-time.Second)) {

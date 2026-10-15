@@ -6,8 +6,8 @@ import (
 	"time"
 )
 
-// window builds the three headers of one window; empty values are omitted.
-func window(h http.Header, name, status, utilization string, reset time.Time) http.Header {
+// withWindow builds the three headers of one window; empty values are omitted.
+func withWindow(h http.Header, name, status, utilization string, reset time.Time) http.Header {
 	prefix := "Anthropic-Ratelimit-Unified-" + name + "-"
 	if status != "" {
 		h.Set(prefix+"Status", status)
@@ -35,12 +35,12 @@ func newTestStore(now time.Time, creds ...Credential) *Store {
 
 // pair: healthy has headroom everywhere; exhausted has weekly_all rejected but Fable at 40.
 func pair(t *testing.T) (healthy, exhausted Credential) {
-	h := window(http.Header{}, "5h", "allowed", "0.31", sessionReset)
-	window(h, "7d", "allowed", "0.09", weeklyReset)
-	window(h, "7d_oi", "allowed", "0.07", fableReset)
-	e := window(http.Header{}, "5h", "allowed", "0.00", time.Time{})
-	window(e, "7d", "rejected", "1.00", weeklyReset)
-	window(e, "7d_oi", "allowed", "0.40", fableReset)
+	h := withWindow(http.Header{}, "5h", "allowed", "0.31", sessionReset)
+	withWindow(h, "7d", "allowed", "0.09", weeklyReset)
+	withWindow(h, "7d_oi", "allowed", "0.07", fableReset)
+	e := withWindow(http.Header{}, "5h", "allowed", "0.00", time.Time{})
+	withWindow(e, "7d", "rejected", "1.00", weeklyReset)
+	withWindow(e, "7d_oi", "allowed", "0.40", fableReset)
 	return Credential{ID: "healthy", Name: "a", Observations: []Observation{observe(t, h, observedNow)}},
 		Credential{ID: "exhausted", Name: "b", Observations: []Observation{observe(t, e, observedNow)}}
 }

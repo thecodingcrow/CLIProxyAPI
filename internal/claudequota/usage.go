@@ -19,10 +19,19 @@ const exhaustedPercent = 100
 
 const (
 	unifiedHeaderPrefix = "Anthropic-Ratelimit-Unified-"
-	windowSession       = "5h"
-	windowWeeklyAll     = "7d"
-	windowFable         = "7d_oi"
 	statusRejected      = "rejected"
+)
+
+// window is one unified rate-limit window: its header name and its length.
+type window struct {
+	name   string
+	length time.Duration
+}
+
+var (
+	windowSession   = window{"5h", 5 * time.Hour}
+	windowWeeklyAll = window{"7d", 7 * 24 * time.Hour}
+	windowFable     = window{"7d_oi", 7 * 24 * time.Hour}
 )
 
 // Limit is one usage window of an account.
@@ -33,20 +42,31 @@ type Limit struct {
 	ResetsAt *time.Time `json:"resets_at"`
 	// ObservedAt is when the response carrying this window arrived.
 	ObservedAt time.Time `json:"observed_at"`
+	// endsBy is ResetsAt, else ObservedAt plus the window length, so a
+	// reading without reset still expires instead of blocking forever.
+	endsBy time.Time
 }
 
-// exhausted reports whether the window blocks requests at now. A window whose
-// reset time has passed is treated as reset even before the next observation.
+// exhausted reports whether the window blocks requests at now. A window that
+// has ended is treated as reset even before the next observation.
 func (l *Limit) exhausted(now time.Time) bool {
 	if l == nil || (l.Percent < exhaustedPercent && l.Status != statusRejected) {
 		return false
 	}
-	return l.ResetsAt == nil || now.Before(*l.ResetsAt)
+	return now.Before(l.endsBy)
 }
 
-// outlived reports a reading older than its window's reset.
+// outlived reports a reading older than its window's end.
 func (l *Limit) outlived(now time.Time) bool {
-	return l != nil && l.ResetsAt != nil && !now.Before(*l.ResetsAt)
+	return l != nil && !now.Before(l.endsBy)
+}
+
+// usedPercent counts an ended window as unused.
+func (l *Limit) usedPercent(now time.Time) float64 {
+	if l.outlived(now) {
+		return 0
+	}
+	return l.Percent
 }
 
 // Usage is the per-window view of one credential.
@@ -90,15 +110,15 @@ func UsageFrom(observations []Observation) *Usage {
 }
 
 // parseWindow reads one window; nil unless it reports a utilization or a rejection.
-func parseWindow(obs Observation, window string) *Limit {
-	prefix := unifiedHeaderPrefix + window + "-"
+func parseWindow(obs Observation, w window) *Limit {
+	prefix := unifiedHeaderPrefix + w.name + "-"
 	status := strings.ToLower(strings.TrimSpace(obs.Signals[prefix+"Status"]))
 	utilization, errParse := strconv.ParseFloat(strings.TrimSpace(obs.Signals[prefix+"Utilization"]), 64)
 	hasUtilization := errParse == nil && utilization >= 0 && !math.IsInf(utilization, 0)
 	if !hasUtilization && status != statusRejected {
 		return nil
 	}
-	limit := &Limit{Percent: exhaustedPercent, Status: status, ObservedAt: obs.ObservedAt}
+	limit := &Limit{Percent: exhaustedPercent, Status: status, ObservedAt: obs.ObservedAt, endsBy: obs.ObservedAt.Add(w.length)}
 	if hasUtilization {
 		// Utilization is a fraction; rounding hides float noise (0.55*100).
 		limit.Percent = math.Round(utilization*10000) / 100
@@ -106,6 +126,7 @@ func parseWindow(obs Observation, window string) *Limit {
 	if seconds, errReset := strconv.ParseFloat(strings.TrimSpace(obs.Signals[prefix+"Reset"]), 64); errReset == nil && seconds > 0 && !math.IsInf(seconds, 0) {
 		reset := time.Unix(int64(seconds), 0).UTC()
 		limit.ResetsAt = &reset
+		limit.endsBy = reset
 	}
 	return limit
 }
