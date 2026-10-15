@@ -98,7 +98,7 @@ retain the corresponding business operation's fields.
 | `/observability/logs/requests/<id>` | GET | Get a request log. |
 | `/observability/usage/api-keys` | GET | Get API-key usage. |
 | `/observability/usage/queue` | GET | Get queued usage events. |
-| `/observability/usage/models` | GET | Get in-memory token usage per provider, model and subagent flag over the 200-minute recent-request window (`bucket_seconds`, `window_minutes`, `generated_at`, `models[]` sorted by `total_tokens` desc). Input includes cached tokens, output includes reasoning tokens, total = input + output. |
+| `/observability/usage/models?range=<range>` | GET | Get token usage per provider, model and subagent flag over a range; see [Model usage ranges](#model-usage-ranges). |
 | `/credentials` | GET, POST, DELETE | List, upload, or delete credential files. |
 | `/credentials/models` | GET | Get credential models. |
 | `/credentials/quota` | GET | Get per-credential Claude OAuth plan limits (`session` = 5h, `weekly_all` = 7d, `weekly_scoped.Fable` = 7d_oi) derived from the `Anthropic-Ratelimit-Unified-*` headers of normal traffic; never calls Anthropic. `enabled` is always true. Each window comes from the newest response that reported it (`percent`, `status`, `resets_at`, `observed_at`); accounts without an observed window are `pending`. A window past its reset (without a reported reset: `observed_at` plus 5h or 7d) counts as reset, marks the account `stale` and counts as 0% used in `summary`, which averages enabled accounts. A scoped window (Fable) is capped by `weekly_all`, so `summary.scoped.<name>.used_pct` averages `max(scoped, weekly_all)` per account, and an account out of weekly quota counts as fully used even without a reading for the scope. |
@@ -116,6 +116,32 @@ retain the corresponding business operation's fields.
 | `/plugins/store` | GET | List the plugin store. |
 | `/plugins/store/<id>/install` | POST | Install or update a plugin. |
 | `/plugins/<id>/quota` | GET, POST, DELETE | Read, fetch, or reset plugin quota. |
+
+### Model usage ranges
+
+`GET /observability/usage/models?range=window|today|7d|total` sums usage per provider, model and subagent flag. Usage is counted in 10-minute buckets aligned to the Unix epoch.
+
+| `range` | Covers |
+| --- | --- |
+| `window` (default when absent) | The 200-minute recent-request window: the current bucket and the 19 before it. |
+| `today` | Since local midnight in the server's timezone. A bucket counts when it starts at or after midnight, so in zones whose offset is not a multiple of 10 minutes the bucket containing midnight belongs to the previous day. Midnight follows DST: the day is 23 or 25 hours long on transition days. |
+| `7d` | The last 7 × 24 hours: the current bucket and the 1007 before it. |
+| `total` | Everything since tracking began (the first record ever counted, kept across restarts). |
+
+Any other value returns `400` with `{"error": "..."}`.
+
+Response fields:
+
+- `range`: the range served (`window` when the parameter is absent).
+- `since`: RFC3339 start of the covered span, in the server's timezone: now minus 200 minutes for `window`, local midnight for `today`, now minus 7 days for `7d`, the tracking start for `total` (now while nothing was ever recorded).
+- `timezone`: IANA name of the zone used for `today` (from `TZ`, else `/etc/localtime`; `Local` when neither names one).
+- `window_minutes`: minutes from `since` to now, rounded.
+- `bucket_seconds`, `generated_at` (UTC).
+- `models[]`: `provider`, `model`, `subagent`, `requests`, `failed`, `input_tokens`, `output_tokens`, `cached_tokens`, `reasoning_tokens`, `total_tokens`, summed over the range. Rows with no requests are omitted; order is `total_tokens` desc. Input includes cached tokens, output includes reasoning tokens, total = input + output.
+
+At most 512 keys are kept. Past that the least recently active key is folded, buckets and total, into a row with `provider` and `model` both `other`, so no range loses counts.
+
+Persistence: the counters are written as JSON to `model-usage.state` in `WRITABLE_PATH` when set, otherwise in the directory of the config file. The name has no `.json` extension because the config directory may also be the auth directory, where `*.json` files are loaded as credentials. Without a config path nothing is persisted. The file is loaded on start, rewritten atomically (temp file + rename) every 60 seconds when usage changed and on graceful shutdown. It holds, per key, the buckets of the last 7 days and the all-time total; older buckets are pruned, their counts stay in the total. A corrupt or unreadable file does not stop startup: it is renamed to `model-usage.state.bak`, a warning is logged and counting starts empty. The file is local even when a Postgres, git or object store backs the auth files; usage up to 60 seconds before a crash is lost.
 
 ## OAuth
 

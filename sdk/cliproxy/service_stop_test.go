@@ -7,11 +7,14 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/api"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/config"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/modelusage"
+	"github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/usage"
 )
 
 func TestServiceShutdown_ViolentShutdownImmediatelyClosesServer(t *testing.T) {
@@ -80,6 +83,9 @@ func TestServiceShutdown_ViolentShutdownImmediatelyClosesServer(t *testing.T) {
 }
 
 func TestServiceRun_ShutdownContextFreshAtExit(t *testing.T) {
+	// Model usage must land next to the config, not in an inherited WRITABLE_PATH.
+	t.Setenv("WRITABLE_PATH", "")
+	t.Setenv("writable_path", "")
 	ln, errListen := net.Listen("tcp", "127.0.0.1:0")
 	if errListen != nil {
 		t.Fatalf("failed to listen: %v", errListen)
@@ -133,6 +139,7 @@ func TestServiceRun_ShutdownContextFreshAtExit(t *testing.T) {
 	if errCloseConn := conn.Close(); errCloseConn != nil {
 		t.Logf("connection close error: %v", errCloseConn)
 	}
+	usage.PublishRecord(context.Background(), usage.Record{Provider: "stop-test", Model: "m"})
 
 	// Trigger stop.
 	stopStart := time.Now()
@@ -156,5 +163,10 @@ func TestServiceRun_ShutdownContextFreshAtExit(t *testing.T) {
 	if errDialClosed == nil {
 		_ = connClosed.Close()
 		t.Fatal("expected server to be closed after Run exit, but dial succeeded")
+	}
+
+	state, errState := os.ReadFile(filepath.Join(authDir, modelusage.FileName))
+	if errState != nil || !strings.Contains(string(state), `"stop-test"`) {
+		t.Fatalf("model usage not flushed next to config on shutdown: %v %s", errState, state)
 	}
 }
