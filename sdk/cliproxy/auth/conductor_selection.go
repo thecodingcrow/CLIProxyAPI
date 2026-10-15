@@ -66,7 +66,7 @@ func (m *Manager) PluginSchedulerWantsAcrossPriorities() bool {
 
 func isBuiltInSelector(selector Selector) bool {
 	switch selector.(type) {
-	case *RoundRobinSelector, *WeightedRoundRobinSelector, *FillFirstSelector:
+	case *RoundRobinSelector, *WeightedRoundRobinSelector, *FillFirstSelector, *QuotaFirstSelector:
 		return true
 	default:
 		return false
@@ -1729,7 +1729,9 @@ func (m *Manager) useSchedulerFastPath() bool {
 	if m == nil || m.scheduler == nil {
 		return false
 	}
-	return isBuiltInSelector(m.Selector())
+	// The scheduler cannot see quota, so quota ranking always picks through Selector.Pick.
+	selector := m.Selector()
+	return isBuiltInSelector(selector) && !ranksByQuota(selector)
 }
 
 func shouldRetrySchedulerPick(err error) bool {
@@ -1891,6 +1893,7 @@ func (m *Manager) pickNextLegacy(ctx context.Context, provider, model string, op
 	if !handled {
 		selectorCtx := selectorContextForAvailableAuths(ctx, selector, model)
 		selectorCtx = withSessionAffinityTransientAuthIDs(selectorCtx, transientAuthIDs)
+		selectorCtx = m.withQuotaLookup(selectorCtx, selector, model)
 		selected, errPick = selector.Pick(selectorCtx, provider, selectionArgForSelector(selector, model), opts, selectorAuths)
 		if errPick != nil {
 			if isBuiltInSelector(selector) {
@@ -2237,6 +2240,7 @@ func (m *Manager) pickNextMixedLegacy(ctx context.Context, providers []string, m
 	if !handled {
 		selectorCtx := selectorContextForAvailableAuths(ctx, selector, model)
 		selectorCtx = withSessionAffinityTransientAuthIDs(selectorCtx, transientAuthIDs)
+		selectorCtx = m.withQuotaLookup(selectorCtx, selector, model)
 		selected, errPick = selector.Pick(selectorCtx, "mixed", selectionArgForSelector(selector, model), opts, selectorAuths)
 		if errPick != nil {
 			if isBuiltInSelector(selector) {
