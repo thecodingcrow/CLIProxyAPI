@@ -22,10 +22,7 @@ const (
 	WindowMinutes = BucketSeconds * bucketCount / 60
 	// DefaultMaxKeys bounds memory; past it the least recently active key is evicted.
 	DefaultMaxKeys = 512
-	// Distinct node kinds kept per bucket; the rest fold into otherNodeKind.
-	maxNodeKindsPerBucket = 8
-	otherNodeKind         = "other"
-	unknownName           = "unknown"
+	unknownName    = "unknown"
 	// Executor identifier prefix for openai-compatibility entries.
 	openAICompatibleProviderPrefix = "openai-compatible-"
 )
@@ -38,6 +35,7 @@ type Key struct {
 }
 
 // Counters are summed per bucket and per snapshot row.
+// Input includes cached tokens, output includes reasoning tokens, total = input + output.
 type Counters struct {
 	Requests        int64 `json:"requests"`
 	Failed          int64 `json:"failed"`
@@ -64,8 +62,6 @@ type Row struct {
 	Model    string `json:"model"`
 	Subagent bool   `json:"subagent"`
 	Counters
-	// NodeKinds counts requests per non-empty client node kind.
-	NodeKinds map[string]int64 `json:"node_kinds,omitempty"`
 }
 
 // Snapshot is the management endpoint payload.
@@ -79,7 +75,6 @@ type Snapshot struct {
 type bucket struct {
 	id int64
 	Counters
-	nodeKinds map[string]int64
 }
 
 type series struct {
@@ -127,12 +122,12 @@ func (a *Aggregator) HandleUsage(ctx context.Context, record coreusage.Record) {
 	if a == nil {
 		return
 	}
-	key, nodeKind, counters := fromRecord(ctx, record)
-	a.Add(key, nodeKind, counters)
+	key, counters := fromRecord(ctx, record)
+	a.Add(key, counters)
 }
 
 // Add records counters for key in the bucket of the current clock time.
-func (a *Aggregator) Add(key Key, nodeKind string, counters Counters) {
+func (a *Aggregator) Add(key Key, counters Counters) {
 	if a == nil {
 		return
 	}
@@ -150,15 +145,6 @@ func (a *Aggregator) Add(key Key, nodeKind string, counters Counters) {
 		*b = bucket{id: id}
 	}
 	b.add(counters)
-	if nodeKind != "" {
-		if b.nodeKinds == nil {
-			b.nodeKinds = make(map[string]int64)
-		}
-		if _, seen := b.nodeKinds[nodeKind]; !seen && len(b.nodeKinds) >= maxNodeKindsPerBucket {
-			nodeKind = otherNodeKind
-		}
-		b.nodeKinds[nodeKind] += counters.Requests
-	}
 	if id > s.lastID {
 		s.lastID = id
 	}
@@ -211,12 +197,6 @@ func (a *Aggregator) Snapshot() Snapshot {
 				continue
 			}
 			row.add(b.Counters)
-			for kind, n := range b.nodeKinds {
-				if row.NodeKinds == nil {
-					row.NodeKinds = make(map[string]int64)
-				}
-				row.NodeKinds[kind] += n
-			}
 		}
 		if row.Requests == 0 {
 			continue
@@ -243,7 +223,7 @@ func (a *Aggregator) Snapshot() Snapshot {
 }
 
 // fromRecord resolves session and failure the same way the Redis usage queue does.
-func fromRecord(ctx context.Context, record coreusage.Record) (Key, string, Counters) {
+func fromRecord(ctx context.Context, record coreusage.Record) (Key, Counters) {
 	provider := strings.ToLower(strings.TrimSpace(record.Provider))
 	// Compat executors report "openai-compatible-<name>"; the api-keys view groups them by compat name.
 	if compatName := strings.TrimPrefix(provider, openAICompatibleProviderPrefix); compatName != provider && compatName != "" {
@@ -278,18 +258,30 @@ func fromRecord(ctx context.Context, record coreusage.Record) (Key, string, Coun
 		failed = status >= 400
 	}
 
-	detail := coreusage.EnsureTokenBreakdownForProvider(record.Detail, record.Provider, record.ExecutorType)
-	counters := Counters{
-		Requests:        1,
+	counters := tokenCounters(coreusage.EnsureTokenBreakdownForProvider(record.Detail, record.Provider, record.ExecutorType))
+	counters.Requests = 1
+	if failed {
+		counters.Failed = 1
+	}
+	return Key{Provider: provider, Model: model, Subagent: parentSessionID != ""}, counters
+}
+
+// tokenCounters prefers the normalised breakdown: raw Detail fields mean different things per provider.
+func tokenCounters(detail coreusage.Detail) Counters {
+	if bd := detail.TokenBreakdown; bd.Quality == coreusage.TokenAccountingQualityComplete {
+		return Counters{
+			InputTokens:     bd.Input.TotalTokens,
+			OutputTokens:    bd.Output.TotalTokens,
+			CachedTokens:    bd.Input.CacheReadTokens + bd.Input.CacheWriteTokens,
+			ReasoningTokens: bd.Output.ReasoningTokens,
+			TotalTokens:     bd.TotalTokens,
+		}
+	}
+	return Counters{
 		InputTokens:     detail.InputTokens,
 		OutputTokens:    detail.OutputTokens,
 		CachedTokens:    detail.CacheReadTokens + detail.CacheCreationTokens,
 		ReasoningTokens: detail.ReasoningTokens,
 		TotalTokens:     detail.TotalTokens,
 	}
-	if failed {
-		counters.Failed = 1
-	}
-	key := Key{Provider: provider, Model: model, Subagent: parentSessionID != ""}
-	return key, strings.TrimSpace(clientRequestMetadata.NodeKind), counters
 }

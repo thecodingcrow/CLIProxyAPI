@@ -32,9 +32,9 @@ func TestManagementV8ModelUsageRoute(t *testing.T) {
 
 	// Provider unique to this test: the default aggregator is process-wide.
 	const provider = "route-test-provider"
-	modelusage.Default().Add(modelusage.Key{Provider: provider, Model: "m", Subagent: true}, "subagent",
+	modelusage.Default().Add(modelusage.Key{Provider: provider, Model: "m", Subagent: true},
 		modelusage.Counters{Requests: 1, InputTokens: 4, OutputTokens: 6, TotalTokens: 10})
-	modelusage.Default().Add(modelusage.Key{Provider: provider, Model: "m"}, "",
+	modelusage.Default().Add(modelusage.Key{Provider: provider, Model: "m"},
 		modelusage.Counters{Requests: 2, Failed: 1, TotalTokens: 3})
 
 	get := func(authorized bool) *httptest.ResponseRecorder {
@@ -60,14 +60,13 @@ func TestManagementV8ModelUsageRoute(t *testing.T) {
 		WindowMinutes int64  `json:"window_minutes"`
 		GeneratedAt   string `json:"generated_at"`
 		Models        []struct {
-			Provider     string           `json:"provider"`
-			Model        string           `json:"model"`
-			Subagent     bool             `json:"subagent"`
-			Requests     int64            `json:"requests"`
-			Failed       int64            `json:"failed"`
-			OutputTokens int64            `json:"output_tokens"`
-			TotalTokens  int64            `json:"total_tokens"`
-			NodeKinds    map[string]int64 `json:"node_kinds"`
+			Provider     string `json:"provider"`
+			Model        string `json:"model"`
+			Subagent     bool   `json:"subagent"`
+			Requests     int64  `json:"requests"`
+			Failed       int64  `json:"failed"`
+			OutputTokens int64  `json:"output_tokens"`
+			TotalTokens  int64  `json:"total_tokens"`
 		} `json:"models"`
 	}
 	if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
@@ -86,7 +85,7 @@ func TestManagementV8ModelUsageRoute(t *testing.T) {
 		t.Fatalf("want main + subagent rows, got %s", rec.Body.String())
 	}
 	first, second := body.Models[rows[0]], body.Models[rows[1]]
-	if !first.Subagent || first.TotalTokens != 10 || first.OutputTokens != 6 || first.NodeKinds["subagent"] != 1 {
+	if !first.Subagent || first.TotalTokens != 10 || first.OutputTokens != 6 {
 		t.Fatalf("subagent row (highest total first): %+v", first)
 	}
 	if second.Subagent || second.Requests != 2 || second.Failed != 1 {

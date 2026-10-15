@@ -92,7 +92,7 @@ func TestBucketReuseAfterFullRotationResetsCounters(t *testing.T) {
 	}
 }
 
-func TestSubagentSplitAndNodeKind(t *testing.T) {
+func TestSubagentSplit(t *testing.T) {
 	agg := New(newClock().Now, 0)
 	main := record("claude", "claude-opus-5-5", 10, 1)
 	main.SessionID = mainSession
@@ -101,7 +101,6 @@ func TestSubagentSplitAndNodeKind(t *testing.T) {
 	childCtx := internallogging.WithClientRequestMetadata(context.Background(), internallogging.ClientRequestMetadata{
 		SessionID:       childSession,
 		ParentSessionID: mainSession,
-		NodeKind:        "subagent",
 	})
 	agg.HandleUsage(childCtx, record("claude", "claude-opus-5-5", 20, 2))
 
@@ -113,11 +112,11 @@ func TestSubagentSplitAndNodeKind(t *testing.T) {
 	if len(snap.Models) != 2 {
 		t.Fatalf("got %d rows, want main + subagent: %+v", len(snap.Models), snap.Models)
 	}
-	if got := findRow(t, snap, "claude", "claude-opus-5-5", false); got.Requests != 2 || got.TotalTokens != 13 || got.NodeKinds != nil {
+	if got := findRow(t, snap, "claude", "claude-opus-5-5", false); got.Requests != 2 || got.TotalTokens != 13 {
 		t.Fatalf("main row: %+v", got)
 	}
 	child := findRow(t, snap, "claude", "claude-opus-5-5", true)
-	if child.Requests != 1 || child.InputTokens != 20 || child.NodeKinds["subagent"] != 1 {
+	if child.Requests != 1 || child.InputTokens != 20 {
 		t.Fatalf("subagent row: %+v", child)
 	}
 	if snap.Models[0].Subagent != true {
@@ -136,13 +135,53 @@ func TestFailedCounted(t *testing.T) {
 	}
 }
 
-func TestCachedSumsReadAndCreation(t *testing.T) {
+// Each provider reports raw usage differently; rows must carry the normalised meaning
+// (input includes cached, output includes reasoning, total = input + output).
+func TestTokensNormalisedAcrossProviders(t *testing.T) {
+	for _, tc := range []struct {
+		name, provider                          string
+		detail                                  coreusage.Detail
+		input, output, cached, reasoning, total int64
+	}{
+		{
+			// Claude input_tokens is uncached only; cache read and creation are separate.
+			name: "claude", provider: "claude",
+			detail: coreusage.Detail{InputTokens: 5, CacheReadTokens: 7, CacheCreationTokens: 3, OutputTokens: 5},
+			input:  15, output: 5, cached: 10, total: 20,
+		},
+		{
+			// OpenAI prompt_tokens already include cached tokens.
+			name: "openai", provider: "codex",
+			detail: coreusage.Detail{InputTokens: 15, CacheReadTokens: 10, CachedTokens: 10, OutputTokens: 5, TotalTokens: 20},
+			input:  15, output: 5, cached: 10, total: 20,
+		},
+		{
+			// Gemini candidates exclude thoughts.
+			name: "gemini", provider: "gemini",
+			detail: coreusage.Detail{InputTokens: 3, OutputTokens: 4, ReasoningTokens: 6, TotalTokens: 13},
+			input:  3, output: 10, reasoning: 6, total: 13,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			agg := New(newClock().Now, 0)
+			agg.HandleUsage(context.Background(), coreusage.Record{Provider: tc.provider, Model: "m", Detail: tc.detail})
+			got := findRow(t, agg.Snapshot(), tc.provider, "m", false)
+			want := Counters{Requests: 1, InputTokens: tc.input, OutputTokens: tc.output, CachedTokens: tc.cached, ReasoningTokens: tc.reasoning, TotalTokens: tc.total}
+			if got.Counters != want {
+				t.Fatalf("got %+v, want %+v", got.Counters, want)
+			}
+		})
+	}
+}
+
+func TestTokensFallBackToRawWhenUnclassified(t *testing.T) {
 	agg := New(newClock().Now, 0)
-	r := record("claude", "m", 5, 5)
-	r.Detail.CacheReadTokens, r.Detail.CacheCreationTokens = 7, 3
+	r := record("", "m", 4, 2)
+	r.Detail.CacheReadTokens = 1
 	agg.HandleUsage(context.Background(), r)
-	if got := findRow(t, agg.Snapshot(), "claude", "m", false); got.CachedTokens != 10 {
-		t.Fatalf("cached_tokens = %d, want 10", got.CachedTokens)
+	got := findRow(t, agg.Snapshot(), "unknown", "m", false)
+	if got.InputTokens != 4 || got.OutputTokens != 2 || got.CachedTokens != 1 || got.TotalTokens != 6 {
+		t.Fatalf("got %+v, want raw fields", got.Counters)
 	}
 }
 
