@@ -16,7 +16,7 @@ const (
 	DefaultRefreshInterval = 10 * time.Minute
 	// MinRefreshInterval is the floor for any configured interval.
 	MinRefreshInterval = 5 * time.Minute
-	// MaxBackoff caps the retry delay after consecutive failures.
+	// MaxBackoff caps backoff growth unless the interval is longer; jitter adds on top.
 	MaxBackoff = time.Hour
 	// backoffJitter is the maximum extra fraction added to a backoff delay.
 	backoffJitter = 0.2
@@ -190,9 +190,7 @@ func (s *Store) Tick(ctx context.Context) <-chan struct{} {
 	done := make(chan struct{})
 	enabled, interval := s.currentSettings()
 	if !enabled || s.fetcher == nil {
-		s.mu.Lock()
-		s.entries = map[string]*entry{}
-		s.mu.Unlock()
+		s.reset()
 		close(done)
 		return done
 	}
@@ -205,10 +203,10 @@ func (s *Store) Tick(ctx context.Context) <-chan struct{} {
 		close(done)
 		return done
 	}
-	var due []Credential
-	for _, e := range s.entries {
+	var due []string
+	for id, e := range s.entries {
 		if e.pollable(now) {
-			due = append(due, e.cred)
+			due = append(due, id)
 		}
 	}
 	if len(due) == 0 {
@@ -218,7 +216,7 @@ func (s *Store) Tick(ctx context.Context) <-chan struct{} {
 	}
 	s.running = true
 	s.mu.Unlock()
-	sort.Slice(due, func(i, j int) bool { return due[i].ID < due[j].ID })
+	sort.Strings(due)
 
 	go func() {
 		defer close(done)
@@ -227,28 +225,52 @@ func (s *Store) Tick(ctx context.Context) <-chan struct{} {
 			s.running = false
 			s.mu.Unlock()
 		}()
-		for i, cred := range due {
+		for i, id := range due {
 			if i > 0 && !s.pause(ctx, fetchSpacing) {
 				return
 			}
-			s.fetch(ctx, cred, interval)
+			if !s.fetch(ctx, id) {
+				return
+			}
 		}
 	}()
 	return done
 }
 
-func (s *Store) fetch(ctx context.Context, cred Credential, interval time.Duration) {
+// reset drops the cache; a later enable starts every credential's wait anew.
+func (s *Store) reset() {
 	s.mu.Lock()
-	e, ok := s.entries[cred.ID]
-	if !ok {
+	s.entries = map[string]*entry{}
+	s.mu.Unlock()
+}
+
+// fetch polls one credential if it is still due under the current settings and
+// source state, using its current token. It returns false once polling is off,
+// which ends the round.
+func (s *Store) fetch(ctx context.Context, id string) bool {
+	enabled, interval := s.currentSettings()
+	if !enabled {
+		s.reset()
+		return false
+	}
+	now := s.now()
+	s.sync(now, interval)
+	s.mu.Lock()
+	e, ok := s.entries[id]
+	if !ok || e.inflight || !e.pollable(now) {
 		s.mu.Unlock()
-		return
+		return true
 	}
 	e.inflight = true
+	cred := e.cred
 	s.mu.Unlock()
 
 	usage, err := s.fetcher.Fetch(ctx, cred)
+	s.storeResult(e, cred, interval, usage, err)
+	return true
+}
 
+func (s *Store) storeResult(e *entry, cred Credential, interval time.Duration, usage *Usage, err error) {
 	now := s.now()
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -272,15 +294,17 @@ func (s *Store) fetch(ctx context.Context, cred Credential, interval time.Durati
 	log.WithField("auth_id", cred.ID).Debugf("claude quota refresh failed: %v", err)
 }
 
-// backoff doubles interval per consecutive failure, adds up to backoffJitter,
-// and caps at MaxBackoff.
+// backoff doubles interval per consecutive failure up to max(MaxBackoff,
+// interval), so a retry never comes sooner than a healthy poll, then adds up
+// to backoffJitter on top.
 func (s *Store) backoff(interval time.Duration, failures int) time.Duration {
+	ceiling := max(MaxBackoff, interval)
 	delay := interval
-	for i := 0; i < failures && delay < MaxBackoff; i++ {
+	for i := 0; i < failures && delay < ceiling; i++ {
 		delay *= 2
 	}
-	delay = time.Duration(float64(delay) * (1 + backoffJitter*s.jitter()))
-	return min(delay, MaxBackoff)
+	delay = min(delay, ceiling)
+	return time.Duration(float64(delay) * (1 + backoffJitter*s.jitter()))
 }
 
 // sync mirrors the source into entries: new credentials wait one interval,
@@ -316,6 +340,7 @@ func (s *Store) sync(now time.Time, interval time.Duration) {
 // HasQuota implements Reader.
 func (s *Store) HasQuota(authID, model string) (ok, known bool) {
 	if enabled, _ := s.currentSettings(); !enabled {
+		s.reset()
 		return true, false
 	}
 	now := s.now()
@@ -354,6 +379,7 @@ func (s *Store) Snapshot() Snapshot {
 	now := s.now()
 	enabled, interval := s.currentSettings()
 	if !enabled {
+		s.reset()
 		return Snapshot{Enabled: false, GeneratedAt: now, Accounts: []Account{}, Summary: summarize(nil, now)}
 	}
 	s.sync(now, interval)

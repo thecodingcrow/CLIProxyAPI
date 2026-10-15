@@ -140,8 +140,8 @@ func (u *Usage) HasQuota(model string, now time.Time) bool {
 }
 
 // ScopeMatchesModel reports whether a scoped limit's display name names model:
-// case-insensitive, either equal or contained as a hyphenated token
-// ("Nimbus Max" matches "claude-nimbus-max-2").
+// case-insensitive, either equal or present as whole '-'-separated tokens
+// ("Nimbus Max" matches "claude-nimbus-max-2"; "Opus 4" does not match "claude-opus-45").
 func ScopeMatchesModel(displayName, model string) bool {
 	model = strings.ToLower(strings.TrimSpace(model))
 	name := strings.ToLower(strings.TrimSpace(displayName))
@@ -151,5 +151,17 @@ func ScopeMatchesModel(displayName, model string) bool {
 	if model == name {
 		return true
 	}
-	return strings.Contains(model, strings.Join(strings.Fields(name), "-"))
+	token := strings.Join(strings.Fields(name), "-")
+	for offset := 0; offset <= len(model)-len(token); {
+		at := strings.Index(model[offset:], token)
+		if at < 0 {
+			return false
+		}
+		start, end := offset+at, offset+at+len(token)
+		if (start == 0 || model[start-1] == '-') && (end == len(model) || model[end] == '-') {
+			return true
+		}
+		offset = start + 1
+	}
+	return false
 }

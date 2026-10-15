@@ -42,16 +42,18 @@ type fakeUpstream struct {
 	held   map[string]*gate
 	calls  map[string]int
 	order  []string
+	tokens map[string][]string
 }
 
 func newFakeUpstream() *fakeUpstream {
-	return &fakeUpstream{bodies: map[string][]byte{}, errs: map[string]error{}, gates: map[string]*gate{}, held: map[string]*gate{}, calls: map[string]int{}}
+	return &fakeUpstream{bodies: map[string][]byte{}, errs: map[string]error{}, gates: map[string]*gate{}, held: map[string]*gate{}, calls: map[string]int{}, tokens: map[string][]string{}}
 }
 
 func (f *fakeUpstream) Fetch(ctx context.Context, cred Credential) (*Usage, error) {
 	f.mu.Lock()
 	f.calls[cred.ID]++
 	f.order = append(f.order, cred.ID)
+	f.tokens[cred.ID] = append(f.tokens[cred.ID], cred.AccessToken)
 	// A gate holds only the next fetch; later fetches pass straight through.
 	g := f.gates[cred.ID]
 	delete(f.gates, cred.ID)
@@ -144,6 +146,8 @@ type harness struct {
 	settings Settings
 	pauses   []time.Duration
 	jitter   float64
+	// onPause runs inside every spacing pause of a round, outside h.mu.
+	onPause func()
 }
 
 func newHarness(t *testing.T, creds ...Credential) *harness {
@@ -158,8 +162,12 @@ func newHarness(t *testing.T, creds ...Credential) *harness {
 		Now: h.clock.Now,
 		Pause: func(_ context.Context, d time.Duration) bool {
 			h.mu.Lock()
-			defer h.mu.Unlock()
 			h.pauses = append(h.pauses, d)
+			hook := h.onPause
+			h.mu.Unlock()
+			if hook != nil {
+				hook()
+			}
 			return true
 		},
 		Jitter: func() float64 {
@@ -175,6 +183,18 @@ func (h *harness) currentSettings() Settings {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	return h.settings
+}
+
+func (h *harness) setOnPause(hook func()) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	h.onPause = hook
+}
+
+func (h *harness) setInterval(interval time.Duration) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	h.settings.Interval = interval
 }
 
 func (h *harness) setEnabled(enabled bool) {
@@ -440,9 +460,87 @@ func TestBackoffAddsJitterAndCapsAtMaxBackoff(t *testing.T) {
 		h.clock.Advance(MaxBackoff + MaxBackoff/5)
 		h.tick()
 	}
+	// Capped at 1h, jitter applied after the cap.
 	next = accountByID(t, h.store.Snapshot(), "a").NextPollAt
-	if want := h.clock.Now().Add(MaxBackoff); next == nil || !next.Equal(want) {
+	if want := h.clock.Now().Add(66 * time.Minute); next == nil || !next.Equal(want) {
 		t.Fatalf("next poll after many failures = %v, want capped %v", next, want)
+	}
+}
+
+func TestBackoffNeverRetriesSoonerThanALongInterval(t *testing.T) {
+	h := newHarness(t, Credential{ID: "a", AccessToken: "fake-a"})
+	h.setInterval(2 * time.Hour)
+	h.upstream.set("a", nil, errors.New("fetch Claude OAuth usage failed with status 503"))
+	h.jitter = 0.5
+	h.tick()
+	h.clock.Advance(2 * time.Hour)
+	h.tick()
+
+	// Ceiling is the 2h interval, not the 1h backoff cap; plus 0.5 * 20% jitter.
+	next := accountByID(t, h.store.Snapshot(), "a").NextPollAt
+	if want := h.clock.Now().Add(132 * time.Minute); next == nil || !next.Equal(want) {
+		t.Fatalf("next poll after failure with a 2h interval = %v, want %v", next, want)
+	}
+}
+
+// roundWithPauseHook seeds the pair, then runs the first round with hook
+// between its two fetches ("exhausted" first, then "healthy").
+func roundWithPauseHook(t *testing.T, hook func(h *harness)) *harness {
+	t.Helper()
+	h := newPairHarness(t)
+	h.tick()
+	h.clock.Advance(DefaultRefreshInterval)
+	h.setOnPause(func() { hook(h) })
+	h.tick()
+	h.setOnPause(nil)
+	return h
+}
+
+func TestRoundStopsWhenPollingIsDisabledMidRound(t *testing.T) {
+	h := roundWithPauseHook(t, func(h *harness) { h.setEnabled(false) })
+	if got := h.upstream.callCount("healthy"); got != 0 || h.upstream.totalCalls() != 1 {
+		t.Fatalf("calls after disabling mid-round = %v, want only the fetch before the pause", h.upstream.order)
+	}
+}
+
+func TestRoundSkipsCredentialDisabledMidRound(t *testing.T) {
+	h := roundWithPauseHook(t, func(h *harness) {
+		h.source.update("healthy", func(c *Credential) { c.Disabled = true })
+	})
+	if got := h.upstream.callCount("healthy"); got != 0 {
+		t.Fatalf("healthy fetches after it was disabled mid-round = %d, want 0", got)
+	}
+}
+
+func TestReenablingMidRoundWaitsAFullInterval(t *testing.T) {
+	h := roundWithPauseHook(t, func(h *harness) {
+		h.setEnabled(false)
+		h.store.Snapshot()
+		h.setEnabled(true)
+	})
+	if got := h.upstream.totalCalls(); got != 1 {
+		t.Fatalf("calls in the round that saw disable+re-enable = %v, want only the fetch before the pause", h.upstream.order)
+	}
+	h.clock.Advance(DefaultRefreshInterval - time.Second)
+	h.tick()
+	if got := h.upstream.totalCalls(); got != 1 {
+		t.Fatalf("calls before a full interval after re-enabling = %d, want 1", got)
+	}
+	h.clock.Advance(time.Second)
+	h.tick()
+	if got := h.upstream.totalCalls(); got != 3 {
+		t.Fatalf("calls one interval after re-enabling = %d, want 3", got)
+	}
+}
+
+func TestRoundSendsTokenRotatedMidRound(t *testing.T) {
+	h := roundWithPauseHook(t, func(h *harness) {
+		h.source.update("healthy", func(c *Credential) { c.AccessToken = "fake-healthy-rotated" })
+	})
+	h.upstream.mu.Lock()
+	defer h.upstream.mu.Unlock()
+	if got := h.upstream.tokens["healthy"]; len(got) != 1 || got[0] != "fake-healthy-rotated" {
+		t.Fatalf("healthy tokens sent = %v, want the rotated token", got)
 	}
 }
 

@@ -97,6 +97,28 @@ func TestUsageHasQuotaScopedLimitOnlyBlocksMatchingModel(t *testing.T) {
 	}
 }
 
+func TestScopeMatchesModelOnTokenBoundaries(t *testing.T) {
+	cases := []struct {
+		scope, model string
+		want         bool
+	}{
+		{"Fable", "claude-fable-5-1", true},
+		{"Fable", "claude-fable", true},
+		{"fable", "Claude-Fable-5", true},
+		{"Nimbus Max", "claude-nimbus-max-2", true},
+		{"Opus 4", "claude-opus-4-1", true},
+		{"Opus 4", "claude-opus-45", false},
+		{"Fable", "claude-fables-5", false},
+		{"Fable", "claude-superfable-5", false},
+		{"Fable", "", false},
+	}
+	for _, tc := range cases {
+		if got := ScopeMatchesModel(tc.scope, tc.model); got != tc.want {
+			t.Errorf("ScopeMatchesModel(%q, %q) = %v, want %v", tc.scope, tc.model, got, tc.want)
+		}
+	}
+}
+
 func TestUsageHasQuotaIgnoresExhaustedLimitPastItsReset(t *testing.T) {
 	exhausted := parseFixture(t, "usage-weekly-exhausted.json")
 	afterReset := time.Date(2026, 10, 20, 10, 0, 1, 0, time.UTC)
