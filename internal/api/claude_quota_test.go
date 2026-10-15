@@ -405,6 +405,32 @@ func TestQuotaFirstRoutingSkipsASpentSessionUntilItResets(t *testing.T) {
 	}
 }
 
+func TestQuotaFirstRoutingKeepsTheAPIKeyOutWhileOAuthHasQuota(t *testing.T) {
+	q, executor := newQuotaRoutingServer(t)
+	registry.GetGlobalRegistry().RegisterClient("claude-key", "claude", []*registry.ModelInfo{{ID: "claude-sonnet-4-5"}})
+	t.Cleanup(func() { registry.GetGlobalRegistry().UnregisterClient("claude-key") })
+	count := func(served []string, id string) int {
+		n := 0
+		for _, s := range served {
+			if s == id {
+				n++
+			}
+		}
+		return n
+	}
+
+	q.respond("healthy", "claude-sonnet-4-5", unifiedHeaders(q.clock.Now(), "0.10", "0.20", "0.10", "allowed"))
+	served := executor.serve(t, q.manager, "claude-sonnet-4-5", 100)
+	if count(served, "claude-key") != 0 || count(served, "fable-out") == 0 {
+		t.Fatalf("served with fable-out still unknown = %v, want fable-out probed and claude-key never", served)
+	}
+
+	q.respond("fable-out", "claude-sonnet-4-5", unifiedHeaders(q.clock.Now(), "0.10", "0.70", "0.10", "allowed"))
+	if served := executor.serve(t, q.manager, "claude-sonnet-4-5", 100); count(served, "claude-key") != 0 {
+		t.Fatalf("served with both OAuth known-good = %v, want claude-key 0 of 100", served)
+	}
+}
+
 func TestQuotaFirstRoutingSendsFableOnlyToTheCredentialWithQuota(t *testing.T) {
 	q, executor := newQuotaRoutingServer(t)
 

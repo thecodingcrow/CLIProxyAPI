@@ -43,6 +43,7 @@ type claudeQuotaRouting struct{ reader claudequota.Reader }
 func (r claudeQuotaRouting) QuotaStatus(authID, model string) auth.QuotaStatus {
 	status := r.reader.Status(authID, model)
 	return auth.QuotaStatus{
+		Tracked:     status.Tracked,
 		Known:       status.Known,
 		Available:   status.OK,
 		ResetAt:     status.ResetAt,

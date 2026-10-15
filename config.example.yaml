@@ -159,10 +159,13 @@ routing:
   # resets (at least 1 hour; an unreported reset counts as 7 days). Headroom is 100 minus the
   # higher of the weekly and the model's weekly usage. Equal resets favour the account with more
   # left, so accounts drain evenly; a sooner reset drains that account first. The 5h session
-  # only gates availability. Ties round-robin. Credentials without data (no Claude response
-  # observed yet, other providers) share the top tier, so their first response makes them
-  # known. When every credential is exhausted for the model, the one whose limit resets
-  # soonest. Without quota data it behaves exactly like round-robin.
+  # only gates availability. Ties round-robin. Claude OAuth credentials without data yet share
+  # the top tier, so their first response makes them known. Credentials without plan limits
+  # (Claude API keys, other providers in a mixed pick) serve only when no OAuth credential has
+  # quota, before exhausted ones. When every credential is exhausted for the model, the one
+  # whose limit resets soonest. Without quota data it behaves exactly like round-robin.
+  # Pressure only changes when a response reports new usage, so concurrent requests all go to
+  # the current leader until one of them returns.
   # Enable universal session-sticky routing for all clients.
   # Explicit Claude Code, Codex, OpenCode, and pi session headers are preferred,
   # followed by prompt_cache_key, Responses conversation IDs, legacy body IDs,
