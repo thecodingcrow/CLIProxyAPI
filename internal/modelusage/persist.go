@@ -15,8 +15,9 @@ import (
 )
 
 const (
-	// FileName is the state file, placed in WRITABLE_PATH or next to the config file.
-	FileName = "model-usage.json"
+	// FileName is the JSON state file, placed in WRITABLE_PATH or next to the config file.
+	// No .json extension: the config dir may be the auth dir, where *.json files load as credentials.
+	FileName = "model-usage.state"
 	// FlushInterval is how often a dirty aggregator is written while persistence runs.
 	FlushInterval = 60 * time.Second
 	fileVersion   = 1
