@@ -7,11 +7,13 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/api"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/config"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/modelusage"
 )
 
 func TestServiceShutdown_ViolentShutdownImmediatelyClosesServer(t *testing.T) {
@@ -133,6 +135,7 @@ func TestServiceRun_ShutdownContextFreshAtExit(t *testing.T) {
 	if errCloseConn := conn.Close(); errCloseConn != nil {
 		t.Logf("connection close error: %v", errCloseConn)
 	}
+	modelusage.Default().Add(modelusage.Key{Provider: "stop-test", Model: "m"}, modelusage.Counters{Requests: 1})
 
 	// Trigger stop.
 	stopStart := time.Now()
@@ -156,5 +159,10 @@ func TestServiceRun_ShutdownContextFreshAtExit(t *testing.T) {
 	if errDialClosed == nil {
 		_ = connClosed.Close()
 		t.Fatal("expected server to be closed after Run exit, but dial succeeded")
+	}
+
+	state, errState := os.ReadFile(filepath.Join(authDir, modelusage.FileName))
+	if errState != nil || !strings.Contains(string(state), `"stop-test"`) {
+		t.Fatalf("model usage not flushed next to config on shutdown: %v %s", errState, state)
 	}
 }
