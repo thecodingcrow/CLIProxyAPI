@@ -137,8 +137,16 @@ func account(cred Credential, now time.Time) Account {
 func summarize(accounts []Account, now time.Time) Summary {
 	summary := Summary{Averaging: AveragingMean, Scoped: map[string]ScopedSummary{}, GeneratedAt: now}
 	var weekly, session []float64
-	scopedUsed := map[string][]float64{}
-	scopedRemaining := map[string][]float64{}
+	// A scoped window is capped by weekly_all, so an account's effective use of
+	// a scope is max(scoped, weekly), and an account out of weekly quota counts
+	// as fully used for every scope even without a reading for it.
+	type scopeReading struct {
+		weekly    float64
+		hasWeekly bool
+		scoped    map[string]float64
+	}
+	var readings []scopeReading
+	scopeNames := map[string]struct{}{}
 	var withData []Account
 	for _, account := range accounts {
 		if account.Disabled {
@@ -169,11 +177,12 @@ func summarize(accounts []Account, now time.Time) Summary {
 		if account.Session != nil {
 			session = append(session, account.Session.usedPercent(now))
 		}
+		reading := scopeReading{weekly: weeklyPct, hasWeekly: account.WeeklyAll != nil, scoped: map[string]float64{}}
 		for name, limit := range account.WeeklyScoped {
-			used := limit.usedPercent(now)
-			scopedUsed[name] = append(scopedUsed[name], used)
-			scopedRemaining[name] = append(scopedRemaining[name], math.Max(0, 100-math.Max(used, weeklyPct)))
+			reading.scoped[name] = limit.usedPercent(now)
+			scopeNames[name] = struct{}{}
 		}
+		readings = append(readings, reading)
 		for _, limit := range accountLimits(account) {
 			if limit.ResetsAt != nil && limit.ResetsAt.After(now) && (summary.SoonestReset == nil || limit.ResetsAt.Before(*summary.SoonestReset)) {
 				reset := *limit.ResetsAt
@@ -183,8 +192,18 @@ func summarize(accounts []Account, now time.Time) Summary {
 	}
 	summary.WeeklyAllUsedPct = mean(weekly)
 	summary.SessionUsedPct = mean(session)
-	for name, used := range scopedUsed {
-		scoped := ScopedSummary{UsedPct: *mean(used), RemainingPct: *mean(scopedRemaining[name]), Accounts: len(used)}
+	for name := range scopeNames {
+		var used, remaining []float64
+		for _, reading := range readings {
+			own, reported := reading.scoped[name]
+			if !reported && !reading.hasWeekly {
+				continue
+			}
+			effective := math.Max(own, reading.weekly)
+			used = append(used, effective)
+			remaining = append(remaining, math.Max(0, 100-effective))
+		}
+		scoped := ScopedSummary{UsedPct: *mean(used), RemainingPct: *mean(remaining), Accounts: len(used)}
 		for _, account := range withData {
 			if available, reported := account.HasQuota.Scoped[name]; available || (!reported && account.HasQuota.Any) {
 				scoped.AccountsWithQuota++

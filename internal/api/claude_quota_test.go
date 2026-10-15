@@ -210,8 +210,8 @@ func TestCredentialsQuotaEndpointServesObservedHeaders(t *testing.T) {
 	}
 	// remaining = 100 - max(Fable 40, weekly_all 55).
 	sum := snap.Summary
-	if *sum.WeeklyAllUsedPct != 55 || *sum.SessionUsedPct != 10 || sum.Scoped["Fable"].UsedPct != 40 || sum.Scoped["Fable"].RemainingPct != 45 || sum.Accounts.Pending != 1 {
-		t.Fatalf("summary = %+v, want weekly 55, session 10, Fable used 40 remaining 45, 1 pending", sum)
+	if *sum.WeeklyAllUsedPct != 55 || *sum.SessionUsedPct != 10 || sum.Scoped["Fable"].UsedPct != 55 || sum.Scoped["Fable"].RemainingPct != 45 || sum.Accounts.Pending != 1 {
+		t.Fatalf("summary = %+v, want weekly 55, session 10, Fable used 55 remaining 45, 1 pending", sum)
 	}
 	if pending := snapshotAccount(t, snap, "fable-out"); pending.State != claudequota.StatePending || pending.HasQuota != nil {
 		t.Fatalf("credential without signals = %+v, want pending", pending)
