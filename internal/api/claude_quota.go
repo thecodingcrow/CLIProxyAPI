@@ -42,7 +42,14 @@ type claudeQuotaRouting struct{ reader claudequota.Reader }
 
 func (r claudeQuotaRouting) QuotaStatus(authID, model string) auth.QuotaStatus {
 	status := r.reader.Status(authID, model)
-	return auth.QuotaStatus{Known: status.Known, Available: status.OK, ResetAt: status.ResetAt}
+	return auth.QuotaStatus{
+		Tracked:     status.Tracked,
+		Known:       status.Known,
+		Available:   status.OK,
+		ResetAt:     status.ResetAt,
+		HeadroomPct: status.HeadroomPct,
+		DrainBy:     status.DrainBy,
+	}
 }
 
 // claudeQuotaCredential selects Claude OAuth credentials (API-key entries have

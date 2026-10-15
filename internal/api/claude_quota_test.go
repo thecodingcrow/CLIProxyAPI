@@ -343,7 +343,10 @@ func (e *recordingClaudeExecutor) serve(t *testing.T, manager *auth.Manager, mod
 	return append([]string(nil), e.served...)
 }
 
-func TestQuotaFirstRoutingSendsFableOnlyToTheCredentialWithQuota(t *testing.T) {
+// newQuotaRoutingServer routes quota-first over the healthy and fable-out
+// credentials, both serving Fable and Sonnet.
+func newQuotaRoutingServer(t *testing.T) (*quotaTestServer, *recordingClaudeExecutor) {
+	t.Helper()
 	guardExternalDials(t)
 	q := newQuotaTestServer(t, true)
 	q.manager.SetSelector(&auth.QuotaFirstSelector{})
@@ -353,6 +356,83 @@ func TestQuotaFirstRoutingSendsFableOnlyToTheCredentialWithQuota(t *testing.T) {
 		registry.GetGlobalRegistry().RegisterClient(id, "claude", []*registry.ModelInfo{{ID: "claude-fable-5"}, {ID: "claude-sonnet-4-5"}})
 		t.Cleanup(func() { registry.GetGlobalRegistry().UnregisterClient(id) })
 	}
+	return q, executor
+}
+
+func assertServed(t *testing.T, label string, got []string, want string) {
+	t.Helper()
+	if strings.Join(got, ",") != want {
+		t.Fatalf("%s = %v, want %s", label, got, want)
+	}
+}
+
+func TestQuotaFirstRoutingDrainsTheCredentialWithMoreWeeklyHeadroom(t *testing.T) {
+	q, executor := newQuotaRoutingServer(t)
+	q.respond("healthy", "claude-sonnet-4-5", unifiedHeaders(q.clock.Now(), "0.10", "0.20", "0.10", "allowed"))
+	q.respond("fable-out", "claude-sonnet-4-5", unifiedHeaders(q.clock.Now(), "0.10", "0.70", "0.10", "allowed"))
+	assertServed(t, "served at 80 vs 30 headroom", executor.serve(t, q.manager, "claude-sonnet-4-5", 3), "healthy,healthy,healthy")
+
+	q.respond("healthy", "claude-sonnet-4-5", unifiedHeaders(q.clock.Now(), "0.10", "0.71", "0.10", "allowed"))
+	assertServed(t, "served once healthy drops below", executor.serve(t, q.manager, "claude-sonnet-4-5", 2), "fable-out,fable-out")
+}
+
+func TestQuotaFirstRoutingSendsFableToTheCredentialWithFableLeft(t *testing.T) {
+	q, executor := newQuotaRoutingServer(t)
+	q.respond("healthy", "claude-fable-5", unifiedHeaders(q.clock.Now(), "0.10", "0.60", "0.40", "allowed"))
+	q.respond("fable-out", "claude-fable-5", unifiedHeaders(q.clock.Now(), "0.10", "0.30", "1.00", "rejected"))
+
+	assertServed(t, "served Fable", executor.serve(t, q.manager, "claude-fable-5", 3), "healthy,healthy,healthy")
+	// Sonnet sees weekly_all only: 70 left on fable-out against 40.
+	assertServed(t, "served Sonnet", executor.serve(t, q.manager, "claude-sonnet-4-5", 3), "fable-out,fable-out,fable-out")
+}
+
+func TestQuotaFirstRoutingSkipsASpentSessionUntilItResets(t *testing.T) {
+	for name, spend := range map[string]func(http.Header){
+		"utilization 100": func(h http.Header) { h.Set("Anthropic-Ratelimit-Unified-5h-Utilization", "1.00") },
+		"rejected":        func(h http.Header) { h.Set("Anthropic-Ratelimit-Unified-5h-Status", "rejected") },
+	} {
+		t.Run(name, func(t *testing.T) {
+			q, executor := newQuotaRoutingServer(t)
+			spent := unifiedHeaders(q.clock.Now(), "0.40", "0.20", "0.10", "allowed")
+			spend(spent)
+			q.respond("healthy", "claude-sonnet-4-5", spent)
+			q.respond("fable-out", "claude-sonnet-4-5", unifiedHeaders(q.clock.Now(), "0.10", "0.70", "0.10", "allowed"))
+			assertServed(t, "served while healthy's session is spent", executor.serve(t, q.manager, "claude-sonnet-4-5", 3), "fable-out,fable-out,fable-out")
+
+			q.clock.Advance(3 * time.Hour) // the session reset unifiedHeaders reports
+			assertServed(t, "served after the session reset", executor.serve(t, q.manager, "claude-sonnet-4-5", 2), "healthy,healthy")
+		})
+	}
+}
+
+func TestQuotaFirstRoutingKeepsTheAPIKeyOutWhileOAuthHasQuota(t *testing.T) {
+	q, executor := newQuotaRoutingServer(t)
+	registry.GetGlobalRegistry().RegisterClient("claude-key", "claude", []*registry.ModelInfo{{ID: "claude-sonnet-4-5"}})
+	t.Cleanup(func() { registry.GetGlobalRegistry().UnregisterClient("claude-key") })
+	count := func(served []string, id string) int {
+		n := 0
+		for _, s := range served {
+			if s == id {
+				n++
+			}
+		}
+		return n
+	}
+
+	q.respond("healthy", "claude-sonnet-4-5", unifiedHeaders(q.clock.Now(), "0.10", "0.20", "0.10", "allowed"))
+	served := executor.serve(t, q.manager, "claude-sonnet-4-5", 100)
+	if count(served, "claude-key") != 0 || count(served, "fable-out") == 0 {
+		t.Fatalf("served with fable-out still unknown = %v, want fable-out probed and claude-key never", served)
+	}
+
+	q.respond("fable-out", "claude-sonnet-4-5", unifiedHeaders(q.clock.Now(), "0.10", "0.70", "0.10", "allowed"))
+	if served := executor.serve(t, q.manager, "claude-sonnet-4-5", 100); count(served, "claude-key") != 0 {
+		t.Fatalf("served with both OAuth known-good = %v, want claude-key 0 of 100", served)
+	}
+}
+
+func TestQuotaFirstRoutingSendsFableOnlyToTheCredentialWithQuota(t *testing.T) {
+	q, executor := newQuotaRoutingServer(t)
 
 	if got := executor.serve(t, q.manager, "claude-fable-5", 4); strings.Join(got, ",") != "fable-out,healthy,fable-out,healthy" {
 		t.Fatalf("served before any signal = %v, want round-robin over both", got)

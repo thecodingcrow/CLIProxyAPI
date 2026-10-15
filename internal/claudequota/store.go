@@ -36,6 +36,9 @@ type Reader interface {
 
 // Status is one credential's standing for one model.
 type Status struct {
+	// Tracked reports a credential with plan limits (a Claude OAuth one);
+	// Known implies it.
+	Tracked bool
 	// Known is false while the credential has no observed window; callers
 	// must never block routing on an unknown answer.
 	Known bool
@@ -44,6 +47,11 @@ type Status struct {
 	// ResetAt is when the last window or cooldown blocking the model ends; zero
 	// when OK or when a blocking window reports no reset time.
 	ResetAt time.Time
+	// HeadroomPct is the percent left in the weekly window that caps the
+	// model; set only when Known and OK.
+	HeadroomPct float64
+	// DrainBy is when that capping window resets; zero when unreported.
+	DrainBy time.Time
 }
 
 // Store derives quota from the headers each credential already carries; it
@@ -72,7 +80,7 @@ func (s *Store) Status(authID, model string) Status {
 	}
 	usage := UsageFrom(cred.Observations)
 	if usage == nil {
-		return Status{OK: true}
+		return Status{Tracked: true, OK: true}
 	}
 	now := s.now()
 	blocked, until := usage.blockedUntil(model, now)
@@ -84,9 +92,10 @@ func (s *Store) Status(authID, model string) Status {
 		blocked = true
 	}
 	if !blocked {
-		return Status{Known: true, OK: true}
+		headroom, drainBy := usage.headroom(model, now)
+		return Status{Tracked: true, Known: true, OK: true, HeadroomPct: headroom, DrainBy: drainBy}
 	}
-	return Status{Known: true, ResetAt: until}
+	return Status{Tracked: true, Known: true, ResetAt: until}
 }
 
 // cooledDown reports a credential-wide cooldown, or a model cooldown whose

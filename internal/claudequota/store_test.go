@@ -98,10 +98,10 @@ func TestStatusFromObservedWindows(t *testing.T) {
 		id, model string
 		want      Status
 	}{
-		{"healthy", "claude-fable-5", Status{Known: true, OK: true}},
-		{"exhausted", "claude-fable-5", Status{Known: true, ResetAt: weeklyReset}},
-		{"exhausted", "claude-sonnet-4-5", Status{Known: true, ResetAt: weeklyReset}},
-		{"pending", "claude-fable-5", Status{OK: true}},
+		{"healthy", "claude-fable-5", Status{Tracked: true, Known: true, OK: true, HeadroomPct: 91, DrainBy: weeklyReset}},
+		{"exhausted", "claude-fable-5", Status{Tracked: true, Known: true, ResetAt: weeklyReset}},
+		{"exhausted", "claude-sonnet-4-5", Status{Tracked: true, Known: true, ResetAt: weeklyReset}},
+		{"pending", "claude-fable-5", Status{Tracked: true, OK: true}},
 		{"missing", "claude-fable-5", Status{OK: true}},
 	} {
 		if got := store.Status(tc.id, tc.model); got != tc.want {
@@ -109,11 +109,49 @@ func TestStatusFromObservedWindows(t *testing.T) {
 		}
 	}
 	afterReset := newTestStore(weeklyReset, healthy, exhausted)
-	if got := afterReset.Status("exhausted", "claude-sonnet-4-5"); got != (Status{Known: true, OK: true}) {
-		t.Fatalf("Status past the weekly reset = %+v, want known and available", got)
+	// Every window ended: full headroom, next reset unknown.
+	if got := afterReset.Status("exhausted", "claude-sonnet-4-5"); got != (Status{Tracked: true, Known: true, OK: true, HeadroomPct: 100}) {
+		t.Fatalf("Status past the weekly reset = %+v, want known, available, full headroom, no drain-by", got)
 	}
 	if !accountByID(t, afterReset.Snapshot(), "exhausted").Stale {
 		t.Fatal("account past its weekly reset not marked stale")
+	}
+}
+
+func TestStatusHeadroomFollowsTheWeeklyWindowWithLeastLeft(t *testing.T) {
+	h := withWindow(http.Header{}, "5h", "allowed", "0.95", sessionReset)
+	withWindow(h, "7d", "allowed", "0.30", weeklyReset)
+	withWindow(h, "7d_oi", "allowed", "0.60", fableReset)
+	scoped := Credential{ID: "scoped", Observations: []Observation{observe(t, h, observedNow)}}
+	n := withWindow(http.Header{}, "7d", "allowed", "0.20", time.Time{})
+	noReset := Credential{ID: "no-reset", Observations: []Observation{observe(t, n, observedNow)}}
+	// tie builds equal weekly_all and Fable usage with the given resets.
+	tie := func(id string, weekly, fable time.Time) Credential {
+		h := withWindow(http.Header{}, "7d", "allowed", "0.50", weekly)
+		withWindow(h, "7d_oi", "allowed", "0.50", fable)
+		return Credential{ID: id, Observations: []Observation{observe(t, h, observedNow)}}
+	}
+	store := newTestStore(observedNow, scoped, noReset,
+		tie("tie-weekly-later", weeklyReset, fableReset),
+		tie("tie-fable-later", fableReset, weeklyReset),
+		tie("tie-fable-unreported", weeklyReset, time.Time{}))
+
+	for _, tc := range []struct {
+		id, model string
+		want      Status
+	}{
+		// Session usage gates availability only; it never lowers headroom.
+		{"scoped", "claude-fable-5", Status{Tracked: true, Known: true, OK: true, HeadroomPct: 40, DrainBy: fableReset}},
+		{"scoped", "claude-sonnet-4-5", Status{Tracked: true, Known: true, OK: true, HeadroomPct: 70, DrainBy: weeklyReset}},
+		{"no-reset", "claude-sonnet-4-5", Status{Tracked: true, Known: true, OK: true, HeadroomPct: 80}},
+		// Equal headroom: the later reset binds; an unreported one counts as latest.
+		{"tie-weekly-later", "claude-fable-5", Status{Tracked: true, Known: true, OK: true, HeadroomPct: 50, DrainBy: weeklyReset}},
+		{"tie-fable-later", "claude-fable-5", Status{Tracked: true, Known: true, OK: true, HeadroomPct: 50, DrainBy: weeklyReset}},
+		{"tie-fable-unreported", "claude-fable-5", Status{Tracked: true, Known: true, OK: true, HeadroomPct: 50}},
+	} {
+		if got := store.Status(tc.id, tc.model); got != tc.want {
+			t.Errorf("Status(%s, %s) = %+v, want %+v", tc.id, tc.model, got, tc.want)
+		}
 	}
 }
 
@@ -137,10 +175,10 @@ func TestQuotaCooldownBlocksAndExtendsTheReset(t *testing.T) {
 	exhausted.ModelCooldowns = map[string]time.Time{"claude-fable-5": later}
 	store := newTestStore(observedNow, healthy, exhausted)
 
-	if got := store.Status("healthy", "claude-fable-5"); got != (Status{Known: true, ResetAt: cooldown}) {
+	if got := store.Status("healthy", "claude-fable-5"); got != (Status{Tracked: true, Known: true, ResetAt: cooldown}) {
 		t.Fatalf("Status(cooled healthy) = %+v, want blocked until %v", got, cooldown)
 	}
-	if got := store.Status("exhausted", "claude-fable-5"); got != (Status{Known: true, ResetAt: later}) {
+	if got := store.Status("exhausted", "claude-fable-5"); got != (Status{Tracked: true, Known: true, ResetAt: later}) {
 		t.Fatalf("Status(exhausted cooled past its weekly reset) = %+v, want blocked until %v", got, later)
 	}
 	a := accountByID(t, store.Snapshot(), "healthy")
