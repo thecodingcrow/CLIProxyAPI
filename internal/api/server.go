@@ -225,8 +225,7 @@ func NewServer(cfg *config.Config, authManager *auth.Manager, accessManager *sdk
 	s.mgmt = managementHandlers.NewHandler(cfg, configFilePath, authManager)
 	s.mgmt.SetPluginHost(optionState.pluginHost)
 	if authManager != nil && !cfg.Home.Enabled {
-		s.claudeQuota = s.newClaudeQuotaStore(authManager, claudequota.Options{})
-		s.mgmt.SetClaudeQuota(s.claudeQuota)
+		s.attachClaudeQuota(authManager, claudequota.Options{})
 	}
 	s.mgmt.SetConfigReloadHook(optionState.configReloadHook)
 	if optionState.localPassword != "" {
