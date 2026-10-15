@@ -168,6 +168,7 @@ type Manager struct {
 	selector                  Selector
 	hook                      Hook
 	resultPolicy              atomic.Pointer[resultPolicyHolder]
+	quotaProvider             atomic.Pointer[quotaProviderHolder]
 	mu                        sync.RWMutex
 	selectorMu                sync.Mutex
 	configCooldownMu          sync.Mutex

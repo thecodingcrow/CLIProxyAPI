@@ -256,8 +256,8 @@ func TestDisabledPollingNeverFetchesAndReportsDisabled(t *testing.T) {
 	if got := h.upstream.totalCalls(); got != 0 {
 		t.Fatalf("upstream calls = %d, want 0 while disabled", got)
 	}
-	if ok, known := h.store.HasQuota("healthy", "claude-fable-5"); !ok || known {
-		t.Fatalf("HasQuota while disabled = %v/%v, want true/false (unknown never blocks)", ok, known)
+	if st := h.store.Status("healthy", "claude-fable-5"); !st.OK || st.Known {
+		t.Fatalf("HasQuota while disabled = %v/%v, want true/false (unknown never blocks)", st.OK, st.Known)
 	}
 }
 
@@ -279,8 +279,8 @@ func TestFirstPollWaitsOneFullInterval(t *testing.T) {
 	if snap.Summary.Accounts.Total != 2 || snap.Summary.Accounts.Pending != 2 || snap.Summary.WeeklyAllUsedPct != nil {
 		t.Fatalf("summary = %+v, want 2 pending accounts and no percentages", snap.Summary)
 	}
-	if ok, known := h.store.HasQuota("healthy", "claude-fable-5"); !ok || known {
-		t.Fatalf("HasQuota before first poll = %v/%v, want true/false", ok, known)
+	if st := h.store.Status("healthy", "claude-fable-5"); !st.OK || st.Known {
+		t.Fatalf("HasQuota before first poll = %v/%v, want true/false", st.OK, st.Known)
 	}
 
 	h.clock.Advance(time.Second)
@@ -337,17 +337,17 @@ func TestPolledPairReportsQuotaPerAccountAndSummary(t *testing.T) {
 		t.Fatalf("soonest_reset = %v, want %v", sum.SoonestReset, wantReset)
 	}
 
-	if ok, known := h.store.HasQuota("healthy", "claude-fable-5"); !ok || !known {
-		t.Fatalf("HasQuota(healthy, fable) = %v/%v, want true/true", ok, known)
+	if st := h.store.Status("healthy", "claude-fable-5"); !st.OK || !st.Known {
+		t.Fatalf("HasQuota(healthy, fable) = %v/%v, want true/true", st.OK, st.Known)
 	}
-	if ok, known := h.store.HasQuota("exhausted", "claude-fable-5"); ok || !known {
-		t.Fatalf("HasQuota(exhausted, fable) = %v/%v, want false/true", ok, known)
+	if st := h.store.Status("exhausted", "claude-fable-5"); st.OK || !st.Known {
+		t.Fatalf("HasQuota(exhausted, fable) = %v/%v, want false/true", st.OK, st.Known)
 	}
-	if ok, known := h.store.HasQuota("exhausted", "claude-sonnet-4-5"); ok || !known {
-		t.Fatalf("HasQuota(exhausted, sonnet) = %v/%v, want false/true", ok, known)
+	if st := h.store.Status("exhausted", "claude-sonnet-4-5"); st.OK || !st.Known {
+		t.Fatalf("HasQuota(exhausted, sonnet) = %v/%v, want false/true", st.OK, st.Known)
 	}
-	if ok, known := h.store.HasQuota("missing", "claude-fable-5"); !ok || known {
-		t.Fatalf("HasQuota(missing) = %v/%v, want true/false", ok, known)
+	if st := h.store.Status("missing", "claude-fable-5"); !st.OK || st.Known {
+		t.Fatalf("HasQuota(missing) = %v/%v, want true/false", st.OK, st.Known)
 	}
 }
 
@@ -422,8 +422,8 @@ func TestUpstreamErrorKeepsLastGoodValueAndBacksOff(t *testing.T) {
 	if healthy.State != StateError || !healthy.Stale || healthy.Error == "" || healthy.WeeklyAll.Percent != 9 || !healthy.FetchedAt.Equal(lastGood) {
 		t.Fatalf("healthy after error = %+v, want error, stale, last good weekly_all 9 fetched %v", healthy, lastGood)
 	}
-	if ok, known := h.store.HasQuota("healthy", "claude-fable-5"); !ok || !known {
-		t.Fatalf("HasQuota(healthy) after error = %v/%v, want last good value true/true", ok, known)
+	if st := h.store.Status("healthy", "claude-fable-5"); !st.OK || !st.Known {
+		t.Fatalf("HasQuota(healthy) after error = %v/%v, want last good value true/true", st.OK, st.Known)
 	}
 	exhausted := accountByID(t, snap, "exhausted")
 	if exhausted.State != StateOK || exhausted.WeeklyAll.Percent != 9 {
@@ -595,8 +595,8 @@ func TestQuotaCooldownBlocksHasQuota(t *testing.T) {
 	h.source.update("healthy", func(c *Credential) { c.CooldownUntil = until })
 	snap := h.store.Snapshot()
 
-	if ok, known := h.store.HasQuota("healthy", "claude-fable-5"); ok || !known {
-		t.Fatalf("HasQuota(cooled healthy) = %v/%v, want false/true", ok, known)
+	if st := h.store.Status("healthy", "claude-fable-5"); st.OK || !st.Known {
+		t.Fatalf("HasQuota(cooled healthy) = %v/%v, want false/true", st.OK, st.Known)
 	}
 	account := accountByID(t, snap, "healthy")
 	if account.HasQuota.Any || account.CooldownUntil == nil || !account.CooldownUntil.Equal(until) {
@@ -604,12 +604,93 @@ func TestQuotaCooldownBlocksHasQuota(t *testing.T) {
 	}
 }
 
+func TestStatusReportsWhenTheLastBlockingWindowResets(t *testing.T) {
+	session := fixtureNow.Add(2 * time.Hour)
+	weekly := fixtureNow.Add(72 * time.Hour)
+	fable := fixtureNow.Add(48 * time.Hour)
+	h := newHarness(t,
+		Credential{ID: "both", AccessToken: "fake-both"},
+		Credential{ID: "scoped", AccessToken: "fake-scoped"},
+		Credential{ID: "no-reset", AccessToken: "fake-no-reset"},
+	)
+	h.upstream.set("both", []byte(`{"limits":[
+		{"kind":"session","percent":100,"resets_at":"`+session.Format(time.RFC3339)+`"},
+		{"kind":"weekly_all","percent":100,"resets_at":"`+weekly.Format(time.RFC3339)+`"}
+	]}`), nil)
+	h.upstream.set("scoped", []byte(`{"limits":[
+		{"kind":"weekly_all","percent":50,"resets_at":"`+weekly.Format(time.RFC3339)+`"},
+		{"kind":"weekly_scoped","percent":100,"resets_at":"`+fable.Format(time.RFC3339)+`","scope":{"model":{"display_name":"Fable"}}}
+	]}`), nil)
+	h.upstream.set("no-reset", []byte(`{"limits":[
+		{"kind":"session","percent":100,"resets_at":"`+session.Format(time.RFC3339)+`"},
+		{"kind":"weekly_all","percent":100,"resets_at":null}
+	]}`), nil)
+	h.tick()
+	h.clock.Advance(DefaultRefreshInterval)
+	h.tick()
+
+	for _, tc := range []struct {
+		id, model string
+		want      Status
+	}{
+		{"both", "claude-fable-5", Status{Known: true, ResetAt: weekly}},
+		{"scoped", "claude-fable-5", Status{Known: true, ResetAt: fable}},
+		{"scoped", "claude-sonnet-4-5", Status{Known: true, OK: true}},
+		{"no-reset", "claude-fable-5", Status{Known: true}},
+		{"missing", "claude-fable-5", Status{OK: true}},
+	} {
+		if got := h.store.Status(tc.id, tc.model); got.Known != tc.want.Known || got.OK != tc.want.OK || !got.ResetAt.Equal(tc.want.ResetAt) {
+			t.Errorf("Status(%s, %s) = %+v, want %+v", tc.id, tc.model, got, tc.want)
+		}
+	}
+}
+
+func TestStatusCountsQuotaCooldownTowardsTheReset(t *testing.T) {
+	h := newPolledPairHarness(t)
+	weeklyReset := time.Date(2026, 10, 20, 10, 0, 0, 368360000, time.UTC)
+	later := weeklyReset.Add(time.Hour)
+	h.source.update("exhausted", func(c *Credential) { c.CooldownUntil = later })
+	cooldown := h.clock.Now().Add(time.Hour)
+	h.source.update("healthy", func(c *Credential) { c.CooldownUntil = cooldown })
+	h.store.Snapshot()
+
+	if got := h.store.Status("exhausted", "claude-fable-5"); !got.Known || got.OK || !got.ResetAt.Equal(later) {
+		t.Fatalf("Status(exhausted cooled past its weekly reset) = %+v, want blocked until %v", got, later)
+	}
+	if got := h.store.Status("healthy", "claude-fable-5"); !got.Known || got.OK || !got.ResetAt.Equal(cooldown) {
+		t.Fatalf("Status(healthy cooled) = %+v, want blocked until %v", got, cooldown)
+	}
+}
+
+func TestStatusTreatsAValueOlderThanTwoIntervalsAsUnknown(t *testing.T) {
+	h := newPolledPairHarness(t)
+	h.upstream.set("exhausted", nil, errors.New("fetch Claude OAuth usage failed with status 500"))
+	h.clock.Advance(DefaultRefreshInterval)
+	h.tick()
+	if got := h.store.Status("exhausted", "claude-fable-5"); !got.Known || got.OK {
+		t.Fatalf("Status one interval after a failed refresh = %+v, want last good value (blocked)", got)
+	}
+
+	h.clock.Advance(DefaultRefreshInterval + time.Second)
+	if got := h.store.Status("exhausted", "claude-fable-5"); got.Known || !got.OK {
+		t.Fatalf("Status beyond two intervals = %+v, want unknown and available", got)
+	}
+}
+
+func TestStatusWhileDisabledDoesNotAllocate(t *testing.T) {
+	h := newPairHarness(t)
+	h.setEnabled(false)
+	if allocs := testing.AllocsPerRun(100, func() { h.store.Status("healthy", "claude-fable-5") }); allocs != 0 {
+		t.Fatalf("allocations per Status while disabled = %v, want 0", allocs)
+	}
+}
+
 func TestTurningPollingOffDropsCacheAndRestartsWait(t *testing.T) {
 	h := newPolledPairHarness(t)
 	h.setEnabled(false)
 	h.tick()
-	if ok, known := h.store.HasQuota("healthy", "claude-fable-5"); !ok || known {
-		t.Fatalf("HasQuota after disabling = %v/%v, want true/false", ok, known)
+	if st := h.store.Status("healthy", "claude-fable-5"); !st.OK || st.Known {
+		t.Fatalf("HasQuota after disabling = %v/%v, want true/false", st.OK, st.Known)
 	}
 
 	h.setEnabled(true)

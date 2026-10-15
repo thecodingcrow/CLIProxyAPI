@@ -10,15 +10,26 @@ import (
 	"github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/auth"
 )
 
-// newClaudeQuotaStore wires the plan-limit cache to the auth manager and the
-// live config; polling stays off until upstream.claude.usage-quota.enabled.
-func (s *Server) newClaudeQuotaStore(manager *auth.Manager, opts claudequota.Options) *claudequota.Store {
-	return claudequota.NewStore(
+// attachClaudeQuota builds the plan-limit cache over the auth manager and the
+// live config, and hands it to the management endpoint and to quota-first
+// routing; polling stays off until upstream.claude.usage-quota.enabled.
+func (s *Server) attachClaudeQuota(manager *auth.Manager, opts claudequota.Options) {
+	s.claudeQuota = claudequota.NewStore(
 		func() []claudequota.Credential { return claudeQuotaCredentials(manager.List()) },
 		claudequota.ClaudeFetcher{Config: s.getConfig},
 		func() claudequota.Settings { return claudequota.SettingsFromConfig(s.getConfig()) },
 		opts,
 	)
+	s.mgmt.SetClaudeQuota(s.claudeQuota)
+	manager.SetQuotaProvider(claudeQuotaRouting{reader: s.claudeQuota})
+}
+
+// claudeQuotaRouting serves routing from the cache alone; it never triggers a fetch.
+type claudeQuotaRouting struct{ reader claudequota.Reader }
+
+func (r claudeQuotaRouting) QuotaStatus(authID, model string) auth.QuotaStatus {
+	status := r.reader.Status(authID, model)
+	return auth.QuotaStatus{Known: status.Known, Available: status.OK, ResetAt: status.ResetAt}
 }
 
 // startClaudeQuota runs the refresher until stopClaudeQuota.

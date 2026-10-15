@@ -19,7 +19,9 @@ import (
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/api/handlers/management"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/claudequota"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/config"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/registry"
 	"github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/auth"
+	coreexecutor "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/executor"
 )
 
 // guardExternalDials fails the test on any DNS resolution: every real upstream
@@ -122,9 +124,10 @@ func (c *quotaClock) Advance(d time.Duration) {
 }
 
 type quotaTestServer struct {
-	server *Server
-	store  *claudequota.Store
-	clock  *quotaClock
+	server  *Server
+	manager *auth.Manager
+	store   *claudequota.Store
+	clock   *quotaClock
 }
 
 // newQuotaTestServer wires the real management handler, v8 routes and store
@@ -160,14 +163,13 @@ func newQuotaTestServer(t *testing.T, usageQuota string, managementEnabled bool)
 	h.SetLocalPassword("test-password")
 	s := &Server{cfg: cfg, engine: gin.New(), mgmt: h}
 	clock := &quotaClock{now: time.Date(2026, 10, 15, 11, 0, 0, 0, time.UTC)}
-	store := s.newClaudeQuotaStore(manager, claudequota.Options{
+	s.attachClaudeQuota(manager, claudequota.Options{
 		Now:   clock.Now,
 		Pause: func(context.Context, time.Duration) bool { return true },
 	})
-	h.SetClaudeQuota(store)
 	s.managementRoutesEnabled.Store(managementEnabled)
 	s.registerManagementRoutes()
-	return &quotaTestServer{server: s, store: store, clock: clock}
+	return &quotaTestServer{server: s, manager: manager, store: s.claudeQuota, clock: clock}
 }
 
 func (q *quotaTestServer) get(t *testing.T, key string) (int, claudequota.Snapshot, string) {
@@ -256,8 +258,8 @@ func TestCredentialsQuotaEndpointServesCachedLimits(t *testing.T) {
 	if sum.Accounts.Total != 2 || sum.Accounts.Disabled != 1 || *sum.WeeklyAllUsedPct != 54.5 || *sum.SessionUsedPct != 15.5 || sum.Scoped["Fable"].RemainingPct != 45.5 {
 		t.Fatalf("summary = %+v, want 2 enabled (1 disabled), weekly 54.5, session 15.5, Fable remaining 45.5", sum)
 	}
-	if ok, known := q.store.HasQuota("exhausted", "claude-fable-5"); ok || !known {
-		t.Fatalf("HasQuota(exhausted, fable) = %v/%v, want false/true", ok, known)
+	if st := q.store.Status("exhausted", "claude-fable-5"); st.OK || !st.Known {
+		t.Fatalf("HasQuota(exhausted, fable) = %v/%v, want false/true", st.OK, st.Known)
 	}
 
 	q.clock.Advance(claudequota.DefaultRefreshInterval - time.Second)
@@ -297,6 +299,82 @@ func TestCredentialsQuotaRouteAbsentWithoutManagementKey(t *testing.T) {
 
 	if code, _, body := q.get(t, "test-password"); code != http.StatusNotFound {
 		t.Fatalf("GET with management disabled = %d %s, want 404", code, body)
+	}
+}
+
+// recordingClaudeExecutor records which credential served each request and
+// never leaves the process.
+type recordingClaudeExecutor struct {
+	mu     sync.Mutex
+	served []string
+}
+
+func (e *recordingClaudeExecutor) Identifier() string { return "claude" }
+
+func (e *recordingClaudeExecutor) Execute(_ context.Context, a *auth.Auth, _ coreexecutor.Request, _ coreexecutor.Options) (coreexecutor.Response, error) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	e.served = append(e.served, a.ID)
+	return coreexecutor.Response{}, nil
+}
+
+func (e *recordingClaudeExecutor) ExecuteStream(context.Context, *auth.Auth, coreexecutor.Request, coreexecutor.Options) (*coreexecutor.StreamResult, error) {
+	return nil, errors.New("not used")
+}
+
+func (e *recordingClaudeExecutor) Refresh(_ context.Context, a *auth.Auth) (*auth.Auth, error) {
+	return a, nil
+}
+
+func (e *recordingClaudeExecutor) CountTokens(context.Context, *auth.Auth, coreexecutor.Request, coreexecutor.Options) (coreexecutor.Response, error) {
+	return coreexecutor.Response{}, errors.New("not used")
+}
+
+func (e *recordingClaudeExecutor) HttpRequest(context.Context, *auth.Auth, *http.Request) (*http.Response, error) {
+	return nil, errors.New("not used")
+}
+
+// serve sends n Fable requests through the manager and returns the serving credentials.
+func (e *recordingClaudeExecutor) serve(t *testing.T, manager *auth.Manager, n int) []string {
+	t.Helper()
+	e.mu.Lock()
+	e.served = nil
+	e.mu.Unlock()
+	for i := 0; i < n; i++ {
+		if _, err := manager.Execute(context.Background(), []string{"claude"}, coreexecutor.Request{Model: "claude-fable-5"}, coreexecutor.Options{}); err != nil {
+			t.Fatalf("Execute: %v", err)
+		}
+	}
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	return append([]string(nil), e.served...)
+}
+
+func TestQuotaFirstRoutingSendsFableOnlyToTheCredentialWithQuota(t *testing.T) {
+	guardExternalDials(t)
+	upstream := newFakeUsageUpstream(t, map[string]string{"fake-healthy": "usage-healthy.json", "fake-exhausted": "usage-weekly-exhausted.json"})
+	q := newQuotaTestServer(t, usageQuotaYAML(upstream), true)
+	q.manager.SetSelector(&auth.QuotaFirstSelector{})
+	executor := &recordingClaudeExecutor{}
+	q.manager.RegisterExecutor(executor)
+	for _, id := range []string{"healthy", "exhausted"} {
+		registry.GetGlobalRegistry().RegisterClient(id, "claude", []*registry.ModelInfo{{ID: "claude-fable-5"}})
+		t.Cleanup(func() { registry.GetGlobalRegistry().UnregisterClient(id) })
+	}
+
+	q.tick()
+	if got := executor.serve(t, q.manager, 4); strings.Join(got, ",") != "exhausted,healthy,exhausted,healthy" {
+		t.Fatalf("served before the first poll = %v, want round-robin over both", got)
+	}
+
+	q.clock.Advance(claudequota.DefaultRefreshInterval)
+	q.tick()
+	before := upstream.total()
+	if got := executor.serve(t, q.manager, 4); strings.Join(got, ",") != "healthy,healthy,healthy,healthy" {
+		t.Fatalf("served after the poll = %v, want only healthy (exhausted is at weekly_all 100 despite Fable 40)", got)
+	}
+	if got := upstream.total(); got != before {
+		t.Fatalf("usage requests during routing = %d, want none", got-before)
 	}
 }
 
