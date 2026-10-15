@@ -81,9 +81,9 @@ func TestSnapshotReportsQuotaPerAccountAndSummary(t *testing.T) {
 	if sum.Accounts.Total != 3 || sum.Accounts.WithData != 2 || sum.Accounts.Pending != 1 || sum.Accounts.WithQuotaAny != 1 {
 		t.Fatalf("summary accounts = %+v", sum.Accounts)
 	}
-	// Means of (9, 100) and (31, 0); Fable used mean(7, 40), remaining mean(91, 0).
+	// Means of (9, 100) and (31, 0); Fable used mean(max(7, 9), max(40, 100)), remaining mean(91, 0).
 	fable := sum.Scoped[ScopeFable]
-	if *sum.WeeklyAllUsedPct != 54.5 || *sum.SessionUsedPct != 15.5 || fable.UsedPct != 23.5 || fable.RemainingPct != 45.5 || fable.AccountsWithQuota != 1 || fable.Accounts != 2 {
+	if *sum.WeeklyAllUsedPct != 54.5 || *sum.SessionUsedPct != 15.5 || fable.UsedPct != 54.5 || fable.RemainingPct != 45.5 || fable.AccountsWithQuota != 1 || fable.Accounts != 2 {
 		t.Fatalf("summary = %+v, Fable %+v", sum, fable)
 	}
 	if sum.SoonestReset == nil || !sum.SoonestReset.Equal(sessionReset) {
