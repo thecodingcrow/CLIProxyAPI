@@ -127,7 +127,9 @@ func TestPruneKeepsOnlySevenDaysInMemoryAndFile(t *testing.T) {
 	agg.Open(path)
 	agg.Add(Key{Provider: "p", Model: "busy"}, Counters{Requests: 1})
 	agg.Add(Key{Provider: "p", Model: "idle"}, Counters{Requests: 1})
-	clock.Advance(8 * 24 * time.Hour)
+	clock.Advance(time.Duration(BucketSeconds) * time.Second)
+	agg.Add(Key{Provider: "p", Model: "edge"}, Counters{Requests: 1})
+	clock.Advance(7*24*time.Hour - time.Duration(BucketSeconds)*time.Second) // idle's bucket is exactly 7 days old
 	agg.Add(Key{Provider: "p", Model: "busy"}, Counters{Requests: 1})
 	if err := agg.Flush(); err != nil {
 		t.Fatal(err)
@@ -142,8 +144,11 @@ func TestPruneKeepsOnlySevenDaysInMemoryAndFile(t *testing.T) {
 			}
 		}
 	}
-	if file["busy"] == 0 {
-		t.Fatalf("busy key's current bucket missing from file: %v", file)
+	if _, ok := file["idle"]; ok {
+		t.Fatalf("idle bucket exactly 7 days old kept: %v", file)
+	}
+	if file["edge"] != firstKept || file["busy"] == 0 {
+		t.Fatalf("buckets within 7 days missing from file: %v (first kept %d)", file, firstKept)
 	}
 
 	reloaded := New(clock.Now, 0)
@@ -190,6 +195,26 @@ func TestFutureBucketsFromFileAreClampedAndPruningContinues(t *testing.T) {
 	agg.mu.Unlock()
 	if n != 1 {
 		t.Fatalf("%d buckets held, want 1: pruning stalled behind a future bucket", n)
+	}
+}
+
+// A clock that jumps 8 days ahead and is corrected back leaves a future bucket; usage recorded
+// after the correction is within 7 days of now and must survive it.
+func TestCorrectedClockJumpKeepsCurrentBuckets(t *testing.T) {
+	clock := newClock()
+	agg := New(clock.Now, 0)
+	key := Key{Provider: "p", Model: "m"}
+	clock.Advance(8 * 24 * time.Hour)
+	agg.Add(key, Counters{Requests: 1, TotalTokens: 1})
+	clock.Advance(-8 * 24 * time.Hour)
+	agg.Add(key, Counters{Requests: 1, TotalTokens: 2})
+	agg.Add(key, Counters{Requests: 1, TotalTokens: 4})
+
+	if got := sumTokens(agg.Snapshot(Range7d)); got != 6 {
+		t.Fatalf("7d tokens %d after correction, want 6", got)
+	}
+	if got := sumTokens(agg.Snapshot(RangeTotal)); got != 7 {
+		t.Fatalf("total tokens %d, want 7", got)
 	}
 }
 
