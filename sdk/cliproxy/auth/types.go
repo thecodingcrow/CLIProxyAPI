@@ -158,9 +158,10 @@ func IsPluginVirtualAuth(auth *Auth) bool {
 	return strings.EqualFold(strings.TrimSpace(auth.Attributes[AttributePluginVirtual]), pluginVirtualAttrEnabled)
 }
 
+// Recent-request ring geometry; other windowed stats reuse it to stay aligned with dashboard counts.
 const (
-	recentRequestBucketSeconds int64 = 10 * 60
-	recentRequestBucketCount         = 20
+	RecentRequestBucketSeconds int64 = 10 * 60
+	RecentRequestBucketCount         = 20
 )
 
 type recentRequestBucket struct {
@@ -170,7 +171,7 @@ type recentRequestBucket struct {
 }
 
 type recentRequestRing struct {
-	buckets [recentRequestBucketCount]recentRequestBucket
+	buckets [RecentRequestBucketCount]recentRequestBucket
 }
 
 type RecentRequestBucket struct {
@@ -230,24 +231,25 @@ type ModelState struct {
 	UpdatedAt time.Time `json:"updated_at"`
 }
 
-func recentRequestBucketID(now time.Time) int64 {
+// RecentRequestBucketID returns the epoch-aligned bucket number containing now; zero time maps to 0.
+func RecentRequestBucketID(now time.Time) int64 {
 	if now.IsZero() {
 		return 0
 	}
-	return now.Unix() / recentRequestBucketSeconds
+	return now.Unix() / RecentRequestBucketSeconds
 }
 
 func recentRequestBucketIndex(bucketID int64) int {
-	mod := bucketID % int64(recentRequestBucketCount)
+	mod := bucketID % int64(RecentRequestBucketCount)
 	if mod < 0 {
-		mod += int64(recentRequestBucketCount)
+		mod += int64(RecentRequestBucketCount)
 	}
 	return int(mod)
 }
 
 func formatRecentRequestBucketLabel(bucketID int64) string {
-	start := time.Unix(bucketID*recentRequestBucketSeconds, 0).In(time.Local)
-	end := start.Add(time.Duration(recentRequestBucketSeconds) * time.Second)
+	start := time.Unix(bucketID*RecentRequestBucketSeconds, 0).In(time.Local)
+	end := start.Add(time.Duration(RecentRequestBucketSeconds) * time.Second)
 	return start.Format("15:04") + "-" + end.Format("15:04")
 }
 
@@ -255,7 +257,7 @@ func (a *Auth) recordRecentRequest(now time.Time, success bool) {
 	if a == nil {
 		return
 	}
-	bucketID := recentRequestBucketID(now)
+	bucketID := RecentRequestBucketID(now)
 	idx := recentRequestBucketIndex(bucketID)
 	bucket := &a.recentRequests.buckets[idx]
 	if bucket.bucketID != bucketID {
@@ -271,13 +273,13 @@ func (a *Auth) recordRecentRequest(now time.Time, success bool) {
 }
 
 func (a *Auth) RecentRequestsSnapshot(now time.Time) []RecentRequestBucket {
-	out := make([]RecentRequestBucket, 0, recentRequestBucketCount)
+	out := make([]RecentRequestBucket, 0, RecentRequestBucketCount)
 	if a == nil {
 		return out
 	}
 
-	currentBucketID := recentRequestBucketID(now)
-	for i := recentRequestBucketCount - 1; i >= 0; i-- {
+	currentBucketID := RecentRequestBucketID(now)
+	for i := RecentRequestBucketCount - 1; i >= 0; i-- {
 		bucketID := currentBucketID - int64(i)
 		idx := recentRequestBucketIndex(bucketID)
 		bucket := a.recentRequests.buckets[idx]

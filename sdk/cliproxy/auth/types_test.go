@@ -220,12 +220,12 @@ func TestRecentRequestsSnapshotEmptyReturnsTwentyBuckets(t *testing.T) {
 	a := &Auth{}
 
 	got := a.RecentRequestsSnapshot(now)
-	if len(got) != recentRequestBucketCount {
-		t.Fatalf("len = %d, want %d", len(got), recentRequestBucketCount)
+	if len(got) != RecentRequestBucketCount {
+		t.Fatalf("len = %d, want %d", len(got), RecentRequestBucketCount)
 	}
 
-	currentBucketID := now.Unix() / recentRequestBucketSeconds
-	baseBucketID := currentBucketID - int64(recentRequestBucketCount-1)
+	currentBucketID := now.Unix() / RecentRequestBucketSeconds
+	baseBucketID := currentBucketID - int64(RecentRequestBucketCount-1)
 	for i, bucket := range got {
 		if bucket.Success != 0 || bucket.Failed != 0 {
 			t.Fatalf("bucket[%d] counts = %d/%d, want 0/0", i, bucket.Success, bucket.Failed)
@@ -234,7 +234,7 @@ func TestRecentRequestsSnapshotEmptyReturnsTwentyBuckets(t *testing.T) {
 			t.Fatalf("bucket[%d] time label is empty", i)
 		}
 		expectedBucketID := baseBucketID + int64(i)
-		start := time.Unix(expectedBucketID*recentRequestBucketSeconds, 0).In(time.Local)
+		start := time.Unix(expectedBucketID*RecentRequestBucketSeconds, 0).In(time.Local)
 		end := start.Add(10 * time.Minute)
 		expected := start.Format("15:04") + "-" + end.Format("15:04")
 		if bucket.Time != expected {
@@ -251,8 +251,8 @@ func TestRecentRequestsSnapshotIncludesCounts(t *testing.T) {
 	a.recordRecentRequest(now, false)
 
 	got := a.RecentRequestsSnapshot(now)
-	if len(got) != recentRequestBucketCount {
-		t.Fatalf("len = %d, want %d", len(got), recentRequestBucketCount)
+	if len(got) != RecentRequestBucketCount {
+		t.Fatalf("len = %d, want %d", len(got), RecentRequestBucketCount)
 	}
 
 	newest := got[len(got)-1]
@@ -270,8 +270,8 @@ func TestRecentRequestsSnapshotBucketAdvanceMovesCounts(t *testing.T) {
 	a.recordRecentRequest(next, false)
 
 	got := a.RecentRequestsSnapshot(next)
-	if len(got) != recentRequestBucketCount {
-		t.Fatalf("len = %d, want %d", len(got), recentRequestBucketCount)
+	if len(got) != RecentRequestBucketCount {
+		t.Fatalf("len = %d, want %d", len(got), RecentRequestBucketCount)
 	}
 
 	secondNewest := got[len(got)-2]
