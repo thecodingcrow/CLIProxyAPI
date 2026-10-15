@@ -7,7 +7,7 @@ import (
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/claudequota"
 )
 
-// SetClaudeQuota installs the cached Claude plan-limit reader.
+// SetClaudeQuota installs the Claude plan-limit reader.
 func (h *Handler) SetClaudeQuota(reader claudequota.Reader) {
 	if h == nil {
 		return
@@ -17,9 +17,8 @@ func (h *Handler) SetClaudeQuota(reader claudequota.Reader) {
 	h.mu.Unlock()
 }
 
-// GetCredentialsQuota serves the cached per-credential Claude plan limits and
-// their summary. It only reads memory; polling belongs to the background
-// refresher and stays off unless upstream.claude.usage-quota.enabled is set.
+// GetCredentialsQuota serves per-credential Claude plan limits derived from
+// observed rate-limit headers, and their summary. It only reads memory.
 func (h *Handler) GetCredentialsQuota(c *gin.Context) {
 	h.mu.Lock()
 	reader := h.claudeQuota

@@ -1,99 +1,172 @@
 package claudequota
 
 import (
-	"os"
-	"path/filepath"
+	"net/http"
+	"strconv"
 	"testing"
 	"time"
+
+	"github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/auth"
 )
 
-// fixtureNow sits between the recorded responses' as_of and their earliest reset.
-var fixtureNow = time.Date(2026, 10, 15, 11, 7, 50, 0, time.UTC)
+// observedNow is when the recorded header sets below arrived.
+var observedNow = time.Unix(1787279282, 0).UTC()
 
-func loadFixture(t *testing.T, name string) []byte {
+var (
+	sessionReset = time.Unix(1787296800, 0).UTC()
+	weeklyReset  = time.Unix(1787695200, 0).UTC()
+	fableReset   = time.Unix(1787600000, 0).UTC()
+)
+
+// observe stores headers the way the auth manager does for a Claude response.
+func observe(t *testing.T, headers http.Header, at time.Time) Observation {
 	t.Helper()
-	body, err := os.ReadFile(filepath.Join("testdata", name))
-	if err != nil {
-		t.Fatalf("read fixture %s: %v", name, err)
+	var quota auth.QuotaState
+	if !quota.ObserveResponseHeadersForProvider("claude", headers, at) {
+		t.Fatalf("headers %v carried no quota signal", headers)
 	}
-	return body
+	return Observation{Signals: quota.Signals, ObservedAt: quota.ObservedAt}
 }
 
-func parseFixture(t *testing.T, name string) *Usage {
-	t.Helper()
-	usage, err := ParseUsage(loadFixture(t, name))
-	if err != nil {
-		t.Fatalf("ParseUsage(%s) error = %v", name, err)
-	}
-	return usage
-}
+func unix(at time.Time) []string { return []string{strconv.FormatInt(at.Unix(), 10)} }
 
-func TestParseUsageReadsRecordedLimits(t *testing.T) {
-	healthy := parseFixture(t, "usage-healthy.json")
-	if healthy.Session == nil || healthy.Session.Percent != 31 || healthy.Session.Severity != "normal" || !healthy.Session.IsActive {
-		t.Fatalf("healthy session = %+v, want 31%% normal active", healthy.Session)
-	}
-	wantSessionReset := time.Date(2026, 10, 15, 14, 19, 59, 687096000, time.UTC)
-	if healthy.Session.ResetsAt == nil || !healthy.Session.ResetsAt.Equal(wantSessionReset) {
-		t.Fatalf("healthy session resets_at = %v, want %v", healthy.Session.ResetsAt, wantSessionReset)
-	}
-	if healthy.WeeklyAll == nil || healthy.WeeklyAll.Percent != 9 {
-		t.Fatalf("healthy weekly_all = %+v, want 9%%", healthy.WeeklyAll)
-	}
-	if fable, ok := healthy.Scoped["Fable"]; !ok || fable.Percent != 7 {
-		t.Fatalf("healthy scoped = %+v, want Fable 7%%", healthy.Scoped)
-	}
-
-	exhausted := parseFixture(t, "usage-weekly-exhausted.json")
-	if exhausted.Session == nil || exhausted.Session.ResetsAt != nil || exhausted.Session.Percent != 0 {
-		t.Fatalf("exhausted session = %+v, want 0%% with null resets_at", exhausted.Session)
-	}
-	if exhausted.WeeklyAll == nil || exhausted.WeeklyAll.Percent != 100 || exhausted.WeeklyAll.Severity != "critical" {
-		t.Fatalf("exhausted weekly_all = %+v, want 100%% critical", exhausted.WeeklyAll)
-	}
-	if fable := exhausted.Scoped["Fable"]; fable.Percent != 40 {
-		t.Fatalf("exhausted Fable = %+v, want 40%%", fable)
+// recordedAllowed is a measured response on an unscoped model: 5h and 7d only.
+func recordedAllowed() http.Header {
+	return http.Header{
+		"Anthropic-Ratelimit-Unified-5h-Status":               {"allowed"},
+		"Anthropic-Ratelimit-Unified-5h-Utilization":          {"0.0"},
+		"Anthropic-Ratelimit-Unified-5h-Reset":                unix(sessionReset),
+		"Anthropic-Ratelimit-Unified-7d-Status":               {"allowed"},
+		"Anthropic-Ratelimit-Unified-7d-Utilization":          {"0.53"},
+		"Anthropic-Ratelimit-Unified-7d-Reset":                unix(weeklyReset),
+		"Anthropic-Ratelimit-Unified-Overage-Disabled-Reason": {"member_zero_credit_limit"},
+		"Anthropic-Ratelimit-Unified-Overage-Status":          {"rejected"},
+		"Anthropic-Ratelimit-Unified-Representative-Claim":    {"five_hour"},
+		"Anthropic-Ratelimit-Unified-Reset":                   unix(sessionReset),
+		"Anthropic-Ratelimit-Unified-Status":                  {"allowed"},
 	}
 }
 
-func TestUsageHasQuotaRequiresSessionWeeklyAndScopedHeadroom(t *testing.T) {
-	healthy := parseFixture(t, "usage-healthy.json")
-	exhausted := parseFixture(t, "usage-weekly-exhausted.json")
+// recordedFableRejected is a Fable-window rejection: shared windows allowed, 7d_oi over.
+func recordedFableRejected() http.Header {
+	return http.Header{
+		"anthropic-ratelimit-unified-status":                  {"rejected"},
+		"anthropic-ratelimit-unified-representative-claim":    {"seven_day_overage_included"},
+		"anthropic-ratelimit-unified-7d-status":               {"allowed"},
+		"anthropic-ratelimit-unified-7d-utilization":          {"0.69"},
+		"anthropic-ratelimit-unified-7d-reset":                unix(weeklyReset),
+		"anthropic-ratelimit-unified-5h-utilization":          {"0.00"},
+		"anthropic-ratelimit-unified-7d_oi-status":            {"rejected"},
+		"anthropic-ratelimit-unified-7d_oi-utilization":       {"1.02"},
+		"anthropic-ratelimit-unified-7d_oi-reset":             unix(fableReset),
+		"anthropic-ratelimit-unified-overage-status":          {"rejected"},
+		"anthropic-ratelimit-unified-overage-disabled-reason": {"org_spend_cap_reached"},
+	}
+}
+
+func percentOf(limit *Limit) float64 {
+	if limit == nil {
+		return -1
+	}
+	return limit.Percent
+}
+
+func TestUsageFromHeaders(t *testing.T) {
 	cases := []struct {
-		name  string
-		usage *Usage
-		model string
-		want  bool
+		name                   string
+		headers                http.Header
+		now                    time.Time
+		session, weekly, fable float64 // -1: window absent
+		fableModel, otherModel bool
 	}{
-		{"healthy serves Fable", healthy, "claude-fable-5", true},
-		{"healthy serves unscoped model", healthy, "claude-sonnet-4-5", true},
-		{"weekly_all 100 blocks Fable despite scoped 40", exhausted, "claude-fable-5", false},
-		{"weekly_all 100 blocks unscoped model", exhausted, "claude-sonnet-4-5", false},
-		{"weekly_all 100 blocks model-agnostic check", exhausted, "", false},
+		{"recorded allowed", recordedAllowed(), observedNow, 0, 53, -1, true, true},
+		{"recorded Fable rejection", recordedFableRejected(), observedNow, 0, 69, 102, false, true},
+		{"rejected 7d without utilization", http.Header{
+			"Anthropic-Ratelimit-Unified-7d-Status": {"rejected"},
+			"Anthropic-Ratelimit-Unified-7d-Reset":  unix(weeklyReset),
+		}, observedNow, -1, 100, -1, false, false},
+		{"rejected 7d_oi below 100 still blocks Fable", http.Header{
+			"Anthropic-Ratelimit-Unified-7d_oi-Status":      {"rejected"},
+			"Anthropic-Ratelimit-Unified-7d_oi-Utilization": {"0.98"},
+		}, observedNow, -1, -1, 98, false, true},
+		{"exhausted 7d past its reset counts as reset", http.Header{
+			"Anthropic-Ratelimit-Unified-7d-Status":      {"rejected"},
+			"Anthropic-Ratelimit-Unified-7d-Utilization": {"1.0"},
+			"Anthropic-Ratelimit-Unified-7d-Reset":       unix(weeklyReset),
+		}, weeklyReset.Add(time.Second), -1, 100, -1, true, true},
+		{"allowed_warning near the limit", http.Header{
+			"Anthropic-Ratelimit-Unified-5h-Status":      {"allowed_warning"},
+			"Anthropic-Ratelimit-Unified-5h-Utilization": {"0.91"},
+		}, observedNow, 91, -1, -1, true, true},
+		{"status without utilization claims nothing", http.Header{
+			"Anthropic-Ratelimit-Unified-5h-Status":         {"allowed"},
+			"Anthropic-Ratelimit-Unified-7d-Utilization":    {"not-a-number"},
+			"Anthropic-Ratelimit-Unified-7d_oi-Utilization": {"NaN"},
+			"Anthropic-Ratelimit-Unified-Status":            {"allowed"},
+		}, observedNow, -1, -1, -1, true, true},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			if got := tc.usage.HasQuota(tc.model, fixtureNow); got != tc.want {
-				t.Fatalf("HasQuota(%q) = %v, want %v", tc.model, got, tc.want)
+			usage := UsageFrom([]Observation{observe(t, tc.headers, observedNow)})
+			if tc.session < 0 && tc.weekly < 0 && tc.fable < 0 {
+				if usage != nil {
+					t.Fatalf("usage = %+v, want nil without any window", usage)
+				}
+				return
+			}
+			var fable *Limit
+			if limit, ok := usage.Scoped[ScopeFable]; ok {
+				fable = &limit
+			}
+			if percentOf(usage.Session) != tc.session || percentOf(usage.WeeklyAll) != tc.weekly || percentOf(fable) != tc.fable {
+				t.Fatalf("percent session/weekly/fable = %v/%v/%v, want %v/%v/%v", percentOf(usage.Session), percentOf(usage.WeeklyAll), percentOf(fable), tc.session, tc.weekly, tc.fable)
+			}
+			if got := usage.HasQuota("claude-fable-5", tc.now); got != tc.fableModel {
+				t.Errorf("HasQuota(fable) = %v, want %v", got, tc.fableModel)
+			}
+			if got := usage.HasQuota("claude-sonnet-4-5", tc.now); got != tc.otherModel {
+				t.Errorf("HasQuota(sonnet) = %v, want %v", got, tc.otherModel)
 			}
 		})
 	}
 }
 
-func TestUsageHasQuotaScopedLimitOnlyBlocksMatchingModel(t *testing.T) {
-	usage, err := ParseUsage([]byte(`{"limits":[
-		{"kind":"session","percent":10,"resets_at":null,"scope":null},
-		{"kind":"weekly_all","percent":50,"resets_at":"2026-10-20T10:00:00+00:00","scope":null},
-		{"kind":"weekly_scoped","percent":100,"resets_at":"2026-10-20T10:00:00+00:00","scope":{"model":{"id":null,"display_name":"Nimbus Max"},"surface":null}}
-	]}`))
-	if err != nil {
-		t.Fatalf("ParseUsage() error = %v", err)
+func TestUsageFromReadsResetsAsUnixSeconds(t *testing.T) {
+	usage := UsageFrom([]Observation{observe(t, recordedFableRejected(), observedNow)})
+	if usage.WeeklyAll.ResetsAt == nil || !usage.WeeklyAll.ResetsAt.Equal(weeklyReset) {
+		t.Fatalf("weekly resets_at = %v, want %v", usage.WeeklyAll.ResetsAt, weeklyReset)
 	}
-	if usage.HasQuota("claude-nimbus-max-2", fixtureNow) {
-		t.Fatal("HasQuota(nimbus-max) = true, want false: its scoped weekly is 100")
+	if usage.Session.ResetsAt != nil {
+		t.Fatalf("session resets_at = %v, want nil when unreported", usage.Session.ResetsAt)
 	}
-	if !usage.HasQuota("claude-fable-5", fixtureNow) {
-		t.Fatal("HasQuota(fable) = false, want true: only Nimbus Max is exhausted")
+	if blocked, until := usage.blockedUntil("claude-fable-5", observedNow); !blocked || !until.Equal(fableReset) {
+		t.Fatalf("blockedUntil(fable) = %v/%v, want blocked until %v", blocked, until, fableReset)
+	}
+}
+
+func TestUsageFromTakesEachWindowFromItsNewestObservation(t *testing.T) {
+	older := observe(t, recordedFableRejected(), observedNow)
+	newer := observe(t, recordedAllowed(), observedNow.Add(time.Minute))
+	usage := UsageFrom([]Observation{newer, older})
+	fable, ok := usage.Scoped[ScopeFable]
+	if !ok || fable.Percent != 102 || !fable.ObservedAt.Equal(observedNow) {
+		t.Fatalf("Fable = %+v (present %v), want 102 kept from the older observation", fable, ok)
+	}
+	if usage.WeeklyAll.Percent != 53 || usage.Session.Status != "allowed" {
+		t.Fatalf("weekly/session = %+v / %+v, want the newer 53 and allowed", usage.WeeklyAll, usage.Session)
+	}
+	if got := usage.observedAt(); !got.Equal(observedNow.Add(time.Minute)) {
+		t.Fatalf("observedAt = %v, want the newest observation", got)
+	}
+}
+
+func TestUsageStaleOnceAWindowOutlivesItsReset(t *testing.T) {
+	usage := UsageFrom([]Observation{observe(t, recordedAllowed(), observedNow)})
+	if usage.stale(sessionReset.Add(-time.Second)) {
+		t.Fatal("stale before any reset")
+	}
+	if !usage.stale(sessionReset) {
+		t.Fatal("not stale once the 5h window reset")
 	}
 }
 
@@ -116,35 +189,5 @@ func TestScopeMatchesModelOnTokenBoundaries(t *testing.T) {
 		if got := ScopeMatchesModel(tc.scope, tc.model); got != tc.want {
 			t.Errorf("ScopeMatchesModel(%q, %q) = %v, want %v", tc.scope, tc.model, got, tc.want)
 		}
-	}
-}
-
-func TestUsageHasQuotaIgnoresExhaustedLimitPastItsReset(t *testing.T) {
-	exhausted := parseFixture(t, "usage-weekly-exhausted.json")
-	afterReset := time.Date(2026, 10, 20, 10, 0, 1, 0, time.UTC)
-	if !exhausted.HasQuota("claude-fable-5", afterReset) {
-		t.Fatal("HasQuota after weekly reset = false, want true")
-	}
-}
-
-func TestParseUsageToleratesNullAndMalformedFields(t *testing.T) {
-	bodies := []string{
-		`{}`,
-		`{"limits":null}`,
-		`{"limits":[null,{"kind":null},{"kind":"session","percent":null,"resets_at":"not-a-time"}]}`,
-		`{"limits":[{"kind":"weekly_scoped","percent":5,"scope":null},{"kind":"weekly_scoped","percent":5,"scope":{"model":null}}]}`,
-		`{"limits":[{"kind":"session","percent":"12"}],"five_hour":{"utilization":"x"}}`,
-	}
-	for _, body := range bodies {
-		usage, err := ParseUsage([]byte(body))
-		if err != nil {
-			t.Fatalf("ParseUsage(%s) error = %v", body, err)
-		}
-		if !usage.HasQuota("claude-fable-5", fixtureNow) {
-			t.Fatalf("ParseUsage(%s).HasQuota = false, want true with no blocking limit", body)
-		}
-	}
-	if _, err := ParseUsage([]byte(`not json`)); err == nil {
-		t.Fatal("ParseUsage(not json) error = nil, want error")
 	}
 }

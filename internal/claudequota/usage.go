@@ -1,128 +1,152 @@
-// Package claudequota caches the plan limits Anthropic reports per Claude OAuth
-// credential (GET /api/oauth/usage) and answers whether a credential still has
-// quota for a model. Reads are memory-only; a background refresher owns every
-// upstream call.
+// Package claudequota derives per-credential Claude plan limits from the
+// Anthropic-Ratelimit-Unified-* headers already observed on normal traffic and
+// answers whether a credential still has quota for a model. It never calls upstream.
 package claudequota
 
 import (
-	"encoding/json"
-	"fmt"
+	"math"
+	"sort"
+	"strconv"
 	"strings"
 	"time"
 )
 
-// Limit kinds reported by the usage endpoint.
-const (
-	KindSession      = "session"
-	KindWeeklyAll    = "weekly_all"
-	KindWeeklyScoped = "weekly_scoped"
-)
+// ScopeFable names the model-scoped weekly window Anthropic reports as 7d_oi.
+const ScopeFable = "Fable"
 
 // exhaustedPercent is the usage at which Anthropic stops serving the window.
 const exhaustedPercent = 100
 
+const (
+	unifiedHeaderPrefix = "Anthropic-Ratelimit-Unified-"
+	windowSession       = "5h"
+	windowWeeklyAll     = "7d"
+	windowFable         = "7d_oi"
+	statusRejected      = "rejected"
+)
+
 // Limit is one usage window of an account.
 type Limit struct {
-	Percent  float64    `json:"percent"`
-	Severity string     `json:"severity,omitempty"`
+	Percent float64 `json:"percent"`
+	// Status is the window's unified status (allowed, allowed_warning, rejected); empty when unreported.
+	Status   string     `json:"status,omitempty"`
 	ResetsAt *time.Time `json:"resets_at"`
-	IsActive bool       `json:"is_active"`
+	// ObservedAt is when the response carrying this window arrived.
+	ObservedAt time.Time `json:"observed_at"`
 }
 
 // exhausted reports whether the window blocks requests at now. A window whose
-// reset time has passed is treated as reset even before the next fetch.
+// reset time has passed is treated as reset even before the next observation.
 func (l *Limit) exhausted(now time.Time) bool {
-	if l == nil || l.Percent < exhaustedPercent {
+	if l == nil || (l.Percent < exhaustedPercent && l.Status != statusRejected) {
 		return false
 	}
 	return l.ResetsAt == nil || now.Before(*l.ResetsAt)
 }
 
-// Usage is the decoded subset of one usage response.
+// outlived reports a reading older than its window's reset.
+func (l *Limit) outlived(now time.Time) bool {
+	return l != nil && l.ResetsAt != nil && !now.Before(*l.ResetsAt)
+}
+
+// Usage is the per-window view of one credential.
 type Usage struct {
 	Session   *Limit
 	WeeklyAll *Limit
-	// Scoped holds model-scoped weekly limits keyed by scope.model.display_name.
+	// Scoped holds model-scoped weekly limits keyed by model display name.
 	Scoped map[string]Limit
 }
 
-type rawLimit struct {
-	Kind     string          `json:"kind"`
-	Percent  json.RawMessage `json:"percent"`
-	Severity string          `json:"severity"`
-	ResetsAt json.RawMessage `json:"resets_at"`
-	IsActive bool            `json:"is_active"`
-	Scope    *struct {
-		Model *struct {
-			DisplayName string `json:"display_name"`
-		} `json:"model"`
-	} `json:"scope"`
+// Observation is one response's quota header snapshot.
+type Observation struct {
+	Signals    map[string]string
+	ObservedAt time.Time
 }
 
-// ParseUsage decodes the limits[] array of a usage response. Unknown keys,
-// unknown kinds and individually malformed limits are skipped; only a body
-// that is not a JSON object fails.
-func ParseUsage(body []byte) (*Usage, error) {
-	var envelope struct {
-		Limits []json.RawMessage `json:"limits"`
-	}
-	if err := json.Unmarshal(body, &envelope); err != nil {
-		return nil, fmt.Errorf("parse Claude usage response: %w", err)
-	}
+// UsageFrom takes each window from the newest observation reporting it, so a
+// response that skipped a window does not erase the last reading of it. Nil
+// when no observation reports any window.
+func UsageFrom(observations []Observation) *Usage {
+	newest := append([]Observation(nil), observations...)
+	sort.SliceStable(newest, func(i, j int) bool { return newest[i].ObservedAt.After(newest[j].ObservedAt) })
 	usage := &Usage{Scoped: map[string]Limit{}}
-	for _, item := range envelope.Limits {
-		var raw rawLimit
-		if err := json.Unmarshal(item, &raw); err != nil {
-			continue
+	for _, obs := range newest {
+		if usage.Session == nil {
+			usage.Session = parseWindow(obs, windowSession)
 		}
-		var percent float64
-		if err := json.Unmarshal(raw.Percent, &percent); err != nil {
-			continue
+		if usage.WeeklyAll == nil {
+			usage.WeeklyAll = parseWindow(obs, windowWeeklyAll)
 		}
-		limit := Limit{Percent: percent, Severity: raw.Severity, IsActive: raw.IsActive, ResetsAt: parseResetsAt(raw.ResetsAt)}
-		switch raw.Kind {
-		case KindSession:
-			usage.Session = maxLimit(usage.Session, limit)
-		case KindWeeklyAll:
-			usage.WeeklyAll = maxLimit(usage.WeeklyAll, limit)
-		case KindWeeklyScoped:
-			if raw.Scope == nil || raw.Scope.Model == nil {
-				continue
-			}
-			name := strings.TrimSpace(raw.Scope.Model.DisplayName)
-			if name == "" {
-				continue
-			}
-			if existing, ok := usage.Scoped[name]; !ok || limit.Percent > existing.Percent {
-				usage.Scoped[name] = limit
+		if _, ok := usage.Scoped[ScopeFable]; !ok {
+			if limit := parseWindow(obs, windowFable); limit != nil {
+				usage.Scoped[ScopeFable] = *limit
 			}
 		}
 	}
-	return usage, nil
-}
-
-func maxLimit(current *Limit, next Limit) *Limit {
-	if current != nil && current.Percent >= next.Percent {
-		return current
-	}
-	return &next
-}
-
-func parseResetsAt(raw json.RawMessage) *time.Time {
-	var value string
-	if err := json.Unmarshal(raw, &value); err != nil || value == "" {
+	if usage.Session == nil && usage.WeeklyAll == nil && len(usage.Scoped) == 0 {
 		return nil
 	}
-	parsed, err := time.Parse(time.RFC3339Nano, value)
-	if err != nil {
+	return usage
+}
+
+// parseWindow reads one window; nil unless it reports a utilization or a rejection.
+func parseWindow(obs Observation, window string) *Limit {
+	prefix := unifiedHeaderPrefix + window + "-"
+	status := strings.ToLower(strings.TrimSpace(obs.Signals[prefix+"Status"]))
+	utilization, errParse := strconv.ParseFloat(strings.TrimSpace(obs.Signals[prefix+"Utilization"]), 64)
+	hasUtilization := errParse == nil && utilization >= 0 && !math.IsInf(utilization, 0)
+	if !hasUtilization && status != statusRejected {
 		return nil
 	}
-	parsed = parsed.UTC()
-	return &parsed
+	limit := &Limit{Percent: exhaustedPercent, Status: status, ObservedAt: obs.ObservedAt}
+	if hasUtilization {
+		// Utilization is a fraction; rounding hides float noise (0.55*100).
+		limit.Percent = math.Round(utilization*10000) / 100
+	}
+	if seconds, errReset := strconv.ParseFloat(strings.TrimSpace(obs.Signals[prefix+"Reset"]), 64); errReset == nil && seconds > 0 && !math.IsInf(seconds, 0) {
+		reset := time.Unix(int64(seconds), 0).UTC()
+		limit.ResetsAt = &reset
+	}
+	return limit
+}
+
+// observedAt is the newest observation among the windows.
+func (u *Usage) observedAt() time.Time {
+	var newest time.Time
+	for _, limit := range u.limits() {
+		if limit.ObservedAt.After(newest) {
+			newest = limit.ObservedAt
+		}
+	}
+	return newest
+}
+
+// stale reports a window read before its own reset; that window counts as reset.
+func (u *Usage) stale(now time.Time) bool {
+	for _, limit := range u.limits() {
+		if limit.outlived(now) {
+			return true
+		}
+	}
+	return false
+}
+
+func (u *Usage) limits() []*Limit {
+	limits := make([]*Limit, 0, 2+len(u.Scoped))
+	if u.Session != nil {
+		limits = append(limits, u.Session)
+	}
+	if u.WeeklyAll != nil {
+		limits = append(limits, u.WeeklyAll)
+	}
+	for _, limit := range u.Scoped {
+		limits = append(limits, &limit)
+	}
+	return limits
 }
 
 // HasQuota reports whether the account can serve model at now: session and
-// weekly_all below 100% and, when a scoped limit matches model, that one too.
+// weekly_all not exhausted and, when a scoped limit matches model, that one too.
 // An empty model checks only the unscoped windows.
 func (u *Usage) HasQuota(model string, now time.Time) bool {
 	if u == nil {
