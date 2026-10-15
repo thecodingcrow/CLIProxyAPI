@@ -7,9 +7,10 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
-	"net/url"
 	"os"
 	"path/filepath"
+	"runtime"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -19,13 +20,14 @@ import (
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/api/handlers/management"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/claudequota"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/config"
+	internallogging "github.com/router-for-me/CLIProxyAPI/v8/internal/logging"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/registry"
 	"github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/auth"
 	coreexecutor "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/executor"
 )
 
 // guardExternalDials fails the test on any DNS resolution: every real upstream
-// (api.anthropic.com, GitHub) is a hostname, the fake upstream is 127.0.0.1.
+// (api.anthropic.com, GitHub) is a hostname.
 func guardExternalDials(t *testing.T) {
 	t.Helper()
 	restore := installDialGuard()
@@ -56,56 +58,6 @@ func installDialGuard() (restore func() []string) {
 	}
 }
 
-// fakeUsageUpstream replays a recorded usage body per bearer token and counts requests.
-type fakeUsageUpstream struct {
-	*httptest.Server
-	mu     sync.Mutex
-	counts map[string]int
-}
-
-func newFakeUsageUpstream(t *testing.T, bodies map[string]string) *fakeUsageUpstream {
-	t.Helper()
-	f := &fakeUsageUpstream{counts: map[string]int{}}
-	f.Server = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		token := strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer ")
-		f.mu.Lock()
-		f.counts[token]++
-		f.mu.Unlock()
-		fixture, ok := bodies[token]
-		if r.URL.Path != "/api/oauth/usage" || r.Header.Get("anthropic-beta") != "oauth-2025-04-20" || !ok {
-			http.Error(w, "unexpected request", http.StatusBadRequest)
-			return
-		}
-		body, err := os.ReadFile(filepath.Join("..", "claudequota", "testdata", fixture))
-		if err != nil {
-			http.Error(w, err.Error(), http.StatusInternalServerError)
-			return
-		}
-		_, _ = w.Write(body)
-	}))
-	t.Cleanup(f.Close)
-	if host, _, _ := net.SplitHostPort(strings.TrimPrefix(f.URL, "http://")); net.ParseIP(host) == nil || !net.ParseIP(host).IsLoopback() {
-		t.Fatalf("fake upstream %s is not loopback", f.URL)
-	}
-	return f
-}
-
-func (f *fakeUsageUpstream) count(token string) int {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	return f.counts[token]
-}
-
-func (f *fakeUsageUpstream) total() int {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	total := 0
-	for _, count := range f.counts {
-		total += count
-	}
-	return total
-}
-
 type quotaClock struct {
 	mu  sync.Mutex
 	now time.Time
@@ -126,18 +78,16 @@ func (c *quotaClock) Advance(d time.Duration) {
 type quotaTestServer struct {
 	server  *Server
 	manager *auth.Manager
-	store   *claudequota.Store
 	clock   *quotaClock
 }
 
 // newQuotaTestServer wires the real management handler, v8 routes and store
-// over two synthetic Claude OAuth credentials holding fake tokens.
-func newQuotaTestServer(t *testing.T, usageQuota string, managementEnabled bool) *quotaTestServer {
+// over synthetic Claude OAuth credentials holding fake tokens.
+func newQuotaTestServer(t *testing.T, managementEnabled bool) *quotaTestServer {
 	t.Helper()
 	gin.SetMode(gin.TestMode)
 	path := filepath.Join(t.TempDir(), "config.yaml")
-	raw := "config-version: 8\nmanagement: {secret-key: test-password}\nupstream:\n  claude:\n    usage-quota: " + usageQuota + "\n"
-	if err := os.WriteFile(path, []byte(raw), 0o600); err != nil {
+	if err := os.WriteFile(path, []byte("config-version: 8\nmanagement: {secret-key: test-password}\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
 	cfg, err := config.LoadConfig(path)
@@ -149,7 +99,7 @@ func newQuotaTestServer(t *testing.T, usageQuota string, managementEnabled bool)
 	manager := auth.NewManager(nil, nil, nil)
 	for _, a := range []*auth.Auth{
 		{ID: "healthy", FileName: "claude-healthy.json", Provider: "claude", Metadata: map[string]any{"type": "claude", "access_token": "fake-healthy", "email": "healthy@example.test"}},
-		{ID: "exhausted", FileName: "claude-exhausted.json", Provider: "claude", Metadata: map[string]any{"type": "claude", "access_token": "fake-exhausted", "email": "exhausted@example.test"}},
+		{ID: "fable-out", FileName: "claude-fable-out.json", Provider: "claude", Metadata: map[string]any{"type": "claude", "access_token": "fake-fable-out"}},
 		{ID: "disabled", FileName: "claude-disabled.json", Provider: "claude", Disabled: true, Status: auth.StatusDisabled, Metadata: map[string]any{"type": "claude", "access_token": "fake-disabled"}},
 		{ID: "claude-key", Provider: "claude", Attributes: map[string]string{"api_key": "fake-key"}},
 		{ID: "codex", FileName: "codex.json", Provider: "codex", Metadata: map[string]any{"access_token": "fake-codex"}},
@@ -162,14 +112,19 @@ func newQuotaTestServer(t *testing.T, usageQuota string, managementEnabled bool)
 	h := management.NewHandler(cfg, path, manager)
 	h.SetLocalPassword("test-password")
 	s := &Server{cfg: cfg, engine: gin.New(), mgmt: h}
-	clock := &quotaClock{now: time.Date(2026, 10, 15, 11, 0, 0, 0, time.UTC)}
-	s.attachClaudeQuota(manager, claudequota.Options{
-		Now:   clock.Now,
-		Pause: func(context.Context, time.Duration) bool { return true },
-	})
+	clock := &quotaClock{now: time.Now()}
+	s.attachClaudeQuota(manager, clock.Now)
 	s.managementRoutesEnabled.Store(managementEnabled)
 	s.registerManagementRoutes()
-	return &quotaTestServer{server: s, manager: manager, store: s.claudeQuota, clock: clock}
+	return &quotaTestServer{server: s, manager: manager, clock: clock}
+}
+
+// respond records one Claude response carrying headers for id, through the
+// manager's own observation path.
+func (q *quotaTestServer) respond(id, model string, headers http.Header) {
+	ctx := internallogging.WithResponseHeadersHolder(auth.WithSkipPersist(context.Background()))
+	internallogging.SetResponseHeaders(ctx, headers)
+	q.manager.MarkResult(ctx, auth.Result{AuthID: id, Provider: "claude", Model: model, Success: true})
 }
 
 func (q *quotaTestServer) get(t *testing.T, key string) (int, claudequota.Snapshot, string) {
@@ -190,14 +145,6 @@ func (q *quotaTestServer) get(t *testing.T, key string) (int, claudequota.Snapsh
 	return recorder.Code, snap, recorder.Body.String()
 }
 
-func (q *quotaTestServer) tick() {
-	<-q.store.Tick(context.Background())
-}
-
-func usageQuotaYAML(upstream *fakeUsageUpstream) string {
-	return "{enabled: true, base-url: " + upstream.URL + "}"
-}
-
 func snapshotAccount(t *testing.T, snap claudequota.Snapshot, id string) claudequota.Account {
 	t.Helper()
 	for _, account := range snap.Accounts {
@@ -209,96 +156,142 @@ func snapshotAccount(t *testing.T, snap claudequota.Snapshot, id string) claudeq
 	return claudequota.Account{}
 }
 
-func TestCredentialsQuotaEndpointServesCachedLimits(t *testing.T) {
+// unifiedHeaders builds a measured-shape response: 5h, 7d and the Fable 7d_oi window.
+func unifiedHeaders(now time.Time, util5h, util7d, util7dOI, status7dOI string) http.Header {
+	reset := func(d time.Duration) string { return strconv.FormatInt(now.Add(d).Unix(), 10) }
+	unified := "allowed"
+	if status7dOI == "rejected" {
+		unified = "rejected"
+	}
+	// Lower-case wire names, canonicalised so later Set/Del address the same key.
+	h := http.Header{}
+	for name, values := range map[string][]string{
+		"anthropic-ratelimit-unified-status":               {unified},
+		"anthropic-ratelimit-unified-representative-claim": {"five_hour"},
+		"anthropic-ratelimit-unified-5h-status":            {"allowed"},
+		"anthropic-ratelimit-unified-5h-utilization":       {util5h},
+		"anthropic-ratelimit-unified-5h-reset":             {reset(3 * time.Hour)},
+		"anthropic-ratelimit-unified-7d-status":            {"allowed"},
+		"anthropic-ratelimit-unified-7d-utilization":       {util7d},
+		"anthropic-ratelimit-unified-7d-reset":             {reset(72 * time.Hour)},
+		"anthropic-ratelimit-unified-7d_oi-status":         {status7dOI},
+		"anthropic-ratelimit-unified-7d_oi-utilization":    {util7dOI},
+		"anthropic-ratelimit-unified-7d_oi-reset":          {reset(48 * time.Hour)},
+		"anthropic-ratelimit-unified-reset":                {reset(3 * time.Hour)},
+	} {
+		if values[0] != "" {
+			h[http.CanonicalHeaderKey(name)] = values
+		}
+	}
+	return h
+}
+
+func TestCredentialsQuotaEndpointServesObservedHeaders(t *testing.T) {
 	guardExternalDials(t)
-	upstream := newFakeUsageUpstream(t, map[string]string{"fake-healthy": "usage-healthy.json", "fake-exhausted": "usage-weekly-exhausted.json"})
-	q := newQuotaTestServer(t, usageQuotaYAML(upstream), true)
+	q := newQuotaTestServer(t, true)
 
 	if code, _, body := q.get(t, ""); code != http.StatusUnauthorized {
 		t.Fatalf("GET without key = %d %s, want 401", code, body)
 	}
-
-	q.tick()
 	code, boot, body := q.get(t, "test-password")
-	if code != http.StatusOK || !boot.Enabled || len(boot.Accounts) != 3 || boot.Summary.Accounts.Pending != 2 {
-		t.Fatalf("GET at boot = %d %s, want enabled with 2 pending accounts plus the disabled one", code, body)
-	}
-	if got := upstream.total(); got != 0 {
-		t.Fatalf("upstream requests at boot = %d, want 0 (first poll waits one interval)", got)
+	if code != http.StatusOK || !boot.Enabled || len(boot.Accounts) != 3 || boot.Summary.Accounts.Pending != 2 || !strings.Contains(body, `"enabled":true`) {
+		t.Fatalf("GET before traffic = %d %s, want enabled with 2 pending accounts plus the disabled one", code, body)
 	}
 
-	q.clock.Advance(claudequota.DefaultRefreshInterval)
-	q.tick()
-	if upstream.count("fake-healthy") != 1 || upstream.count("fake-exhausted") != 1 || upstream.total() != 2 {
-		t.Fatalf("upstream requests after one interval = %v, want one per enabled OAuth credential", upstream.counts)
-	}
-
-	_, first, _ := q.get(t, "test-password")
+	q.respond("healthy", "claude-sonnet-4-5", unifiedHeaders(q.clock.Now(), "0.10", "0.55", "0.40", "allowed"))
 	code, snap, body := q.get(t, "test-password")
-	if code != http.StatusOK || upstream.total() != 2 {
-		t.Fatalf("two rapid GETs = %d, upstream total %d, want 200 and still 2 requests", code, upstream.total())
-	}
-	if !first.GeneratedAt.Equal(snap.GeneratedAt) {
-		t.Fatalf("generated_at moved between reads without a clock change: %v vs %v", first.GeneratedAt, snap.GeneratedAt)
-	}
 	t.Logf("GET /v8/management/credentials/quota:\n%s", body)
-
 	healthy := snapshotAccount(t, snap, "healthy")
-	if healthy.State != claudequota.StateOK || healthy.AuthIndex == "" || healthy.Email != "healthy@example.test" || !healthy.HasQuota.Scoped["Fable"] {
-		t.Fatalf("healthy = %+v, want ok, auth_index, email and Fable quota", healthy)
+	if code != http.StatusOK || healthy.State != claudequota.StateOK || healthy.Stale || healthy.ObservedAt == nil || healthy.Email != "healthy@example.test" {
+		t.Fatalf("healthy = %+v, want ok, fresh, observed_at and email", healthy)
 	}
-	exhausted := snapshotAccount(t, snap, "exhausted")
-	if exhausted.HasQuota.Any || exhausted.HasQuota.Scoped["Fable"] || exhausted.WeeklyScoped["Fable"].Percent != 40 {
-		t.Fatalf("exhausted = %+v, want no quota although Fable scoped is 40", exhausted)
+	if healthy.Session.Percent != 10 || healthy.WeeklyAll.Percent != 55 || healthy.WeeklyScoped["Fable"].Percent != 40 || !healthy.HasQuota.Any || !healthy.HasQuota.Scoped["Fable"] {
+		t.Fatalf("healthy limits = %+v / %+v / %+v, has_quota %+v", healthy.Session, healthy.WeeklyAll, healthy.WeeklyScoped, healthy.HasQuota)
 	}
-	if disabled := snapshotAccount(t, snap, "disabled"); !disabled.Disabled {
-		t.Fatalf("disabled = %+v, want disabled flag", disabled)
-	}
+	// remaining = 100 - max(Fable 40, weekly_all 55).
 	sum := snap.Summary
-	if sum.Accounts.Total != 2 || sum.Accounts.Disabled != 1 || *sum.WeeklyAllUsedPct != 54.5 || *sum.SessionUsedPct != 15.5 || sum.Scoped["Fable"].RemainingPct != 45.5 {
-		t.Fatalf("summary = %+v, want 2 enabled (1 disabled), weekly 54.5, session 15.5, Fable remaining 45.5", sum)
+	if *sum.WeeklyAllUsedPct != 55 || *sum.SessionUsedPct != 10 || sum.Scoped["Fable"].UsedPct != 40 || sum.Scoped["Fable"].RemainingPct != 45 || sum.Accounts.Pending != 1 {
+		t.Fatalf("summary = %+v, want weekly 55, session 10, Fable used 40 remaining 45, 1 pending", sum)
 	}
-	if st := q.store.Status("exhausted", "claude-fable-5"); st.OK || !st.Known {
-		t.Fatalf("HasQuota(exhausted, fable) = %v/%v, want false/true", st.OK, st.Known)
+	if pending := snapshotAccount(t, snap, "fable-out"); pending.State != claudequota.StatePending || pending.HasQuota != nil {
+		t.Fatalf("credential without signals = %+v, want pending", pending)
 	}
-
-	q.clock.Advance(claudequota.DefaultRefreshInterval - time.Second)
-	q.tick()
-	if got := upstream.total(); got != 2 {
-		t.Fatalf("upstream requests before the next interval = %d, want 2", got)
-	}
-	q.clock.Advance(time.Second)
-	q.tick()
-	if got := upstream.total(); got != 4 {
-		t.Fatalf("upstream requests after the second interval = %d, want 4", got)
+	if st := q.server.claudeQuota.Status("fable-out", "claude-fable-5"); st.Known || !st.OK {
+		t.Fatalf("Status without signals = %+v, want unknown and available", st)
 	}
 }
 
-func TestCredentialsQuotaEndpointDisabledByDefault(t *testing.T) {
+func TestCredentialsQuotaFableRejectionBlocksOnlyFable(t *testing.T) {
 	guardExternalDials(t)
-	upstream := newFakeUsageUpstream(t, map[string]string{"fake-healthy": "usage-healthy.json"})
-	q := newQuotaTestServer(t, "{base-url: "+upstream.URL+"}", true)
+	q := newQuotaTestServer(t, true)
+	q.respond("fable-out", "claude-fable-5", unifiedHeaders(q.clock.Now(), "0.10", "0.55", "1.02", "rejected"))
+	// A later unscoped response omits 7d_oi; the Fable model's own snapshot keeps the rejection.
+	later := unifiedHeaders(q.clock.Now(), "0.11", "0.56", "", "")
+	later.Del("anthropic-ratelimit-unified-7d_oi-reset")
+	q.respond("fable-out", "claude-sonnet-4-5", later)
 
-	for i := 0; i < 5; i++ {
-		q.tick()
-		q.clock.Advance(time.Hour)
+	store := q.server.claudeQuota
+	if st := store.Status("fable-out", "claude-fable-5"); !st.Known || st.OK || st.ResetAt.IsZero() {
+		t.Fatalf("Status(fable) = %+v, want known, blocked, with reset", st)
 	}
-	code, snap, body := q.get(t, "test-password")
-	if code != http.StatusOK || snap.Enabled || len(snap.Accounts) != 0 || !strings.Contains(body, `"enabled":false`) {
-		t.Fatalf("GET with polling off = %d %s, want explicit enabled:false and no accounts", code, body)
+	if st := store.Status("fable-out", "claude-sonnet-4-5"); !st.Known || !st.OK {
+		t.Fatalf("Status(sonnet) = %+v, want known and available", st)
 	}
-	if got := upstream.total(); got != 0 {
-		t.Fatalf("upstream requests with polling off = %d, want 0", got)
+	_, snap, _ := q.get(t, "test-password")
+	account := snapshotAccount(t, snap, "fable-out")
+	if !account.HasQuota.Any || account.HasQuota.Scoped["Fable"] || account.WeeklyAll.Percent != 56 {
+		t.Fatalf("account = %+v / %+v, want unscoped quota, no Fable quota, weekly from the newer response", account.HasQuota, account.WeeklyAll)
+	}
+}
+
+func TestCredentialsQuotaWindowPastItsResetIsNotExhausted(t *testing.T) {
+	guardExternalDials(t)
+	q := newQuotaTestServer(t, true)
+	h := unifiedHeaders(q.clock.Now(), "0.80", "1.0", "0.40", "allowed")
+	h.Set("anthropic-ratelimit-unified-7d-status", "rejected")
+	inAnHour := strconv.FormatInt(q.clock.Now().Add(time.Hour).Unix(), 10)
+	for _, window := range []string{"5h", "7d", "7d_oi"} {
+		h.Set("anthropic-ratelimit-unified-"+window+"-reset", inAnHour)
+	}
+	q.respond("healthy", "claude-sonnet-4-5", h)
+	if st := q.server.claudeQuota.Status("healthy", "claude-sonnet-4-5"); st.OK {
+		t.Fatalf("Status before the 7d reset = %+v, want blocked", st)
+	}
+
+	q.clock.Advance(2 * time.Hour)
+	if st := q.server.claudeQuota.Status("healthy", "claude-sonnet-4-5"); !st.Known || !st.OK {
+		t.Fatalf("Status after the 7d reset = %+v, want known and available", st)
+	}
+	_, snap, _ := q.get(t, "test-password")
+	account := snapshotAccount(t, snap, "healthy")
+	if !account.Stale || !account.HasQuota.Any || account.WeeklyAll.Percent != 100 {
+		t.Fatalf("account = %+v, want stale, with quota, raw weekly 100 kept", account)
+	}
+	// Reset windows count as 0% used in the summary.
+	sum := snap.Summary
+	if *sum.WeeklyAllUsedPct != 0 || *sum.SessionUsedPct != 0 || sum.Scoped["Fable"].UsedPct != 0 || sum.Scoped["Fable"].RemainingPct != 100 {
+		t.Fatalf("summary = %+v, Fable %+v, want weekly 0, session 0, Fable used 0 remaining 100", sum, sum.Scoped["Fable"])
 	}
 }
 
 func TestCredentialsQuotaRouteAbsentWithoutManagementKey(t *testing.T) {
 	guardExternalDials(t)
-	upstream := newFakeUsageUpstream(t, nil)
-	q := newQuotaTestServer(t, usageQuotaYAML(upstream), false)
-
+	q := newQuotaTestServer(t, false)
 	if code, _, body := q.get(t, "test-password"); code != http.StatusNotFound {
 		t.Fatalf("GET with management disabled = %d %s, want 404", code, body)
+	}
+}
+
+func TestClaudeQuotaStartsNoGoroutine(t *testing.T) {
+	guardExternalDials(t)
+	manager := auth.NewManager(nil, nil, nil)
+	s := &Server{mgmt: management.NewHandler(&config.Config{}, "", manager)}
+	before := runtime.NumGoroutine()
+	s.attachClaudeQuota(manager, nil)
+	s.claudeQuota.Snapshot()
+	s.claudeQuota.Status("any", "claude-fable-5")
+	if after := runtime.NumGoroutine(); after > before {
+		t.Fatalf("goroutines %d -> %d, want none started by the quota source", before, after)
 	}
 }
 
@@ -334,14 +327,14 @@ func (e *recordingClaudeExecutor) HttpRequest(context.Context, *auth.Auth, *http
 	return nil, errors.New("not used")
 }
 
-// serve sends n Fable requests through the manager and returns the serving credentials.
-func (e *recordingClaudeExecutor) serve(t *testing.T, manager *auth.Manager, n int) []string {
+// serve sends n requests for model through the manager and returns the serving credentials.
+func (e *recordingClaudeExecutor) serve(t *testing.T, manager *auth.Manager, model string, n int) []string {
 	t.Helper()
 	e.mu.Lock()
 	e.served = nil
 	e.mu.Unlock()
 	for i := 0; i < n; i++ {
-		if _, err := manager.Execute(context.Background(), []string{"claude"}, coreexecutor.Request{Model: "claude-fable-5"}, coreexecutor.Options{}); err != nil {
+		if _, err := manager.Execute(context.Background(), []string{"claude"}, coreexecutor.Request{Model: model}, coreexecutor.Options{}); err != nil {
 			t.Fatalf("Execute: %v", err)
 		}
 	}
@@ -352,37 +345,33 @@ func (e *recordingClaudeExecutor) serve(t *testing.T, manager *auth.Manager, n i
 
 func TestQuotaFirstRoutingSendsFableOnlyToTheCredentialWithQuota(t *testing.T) {
 	guardExternalDials(t)
-	upstream := newFakeUsageUpstream(t, map[string]string{"fake-healthy": "usage-healthy.json", "fake-exhausted": "usage-weekly-exhausted.json"})
-	q := newQuotaTestServer(t, usageQuotaYAML(upstream), true)
+	q := newQuotaTestServer(t, true)
 	q.manager.SetSelector(&auth.QuotaFirstSelector{})
 	executor := &recordingClaudeExecutor{}
 	q.manager.RegisterExecutor(executor)
-	for _, id := range []string{"healthy", "exhausted"} {
-		registry.GetGlobalRegistry().RegisterClient(id, "claude", []*registry.ModelInfo{{ID: "claude-fable-5"}})
+	for _, id := range []string{"healthy", "fable-out"} {
+		registry.GetGlobalRegistry().RegisterClient(id, "claude", []*registry.ModelInfo{{ID: "claude-fable-5"}, {ID: "claude-sonnet-4-5"}})
 		t.Cleanup(func() { registry.GetGlobalRegistry().UnregisterClient(id) })
 	}
 
-	q.tick()
-	if got := executor.serve(t, q.manager, 4); strings.Join(got, ",") != "exhausted,healthy,exhausted,healthy" {
-		t.Fatalf("served before the first poll = %v, want round-robin over both", got)
+	if got := executor.serve(t, q.manager, "claude-fable-5", 4); strings.Join(got, ",") != "fable-out,healthy,fable-out,healthy" {
+		t.Fatalf("served before any signal = %v, want round-robin over both", got)
 	}
 
-	q.clock.Advance(claudequota.DefaultRefreshInterval)
-	q.tick()
-	before := upstream.total()
-	if got := executor.serve(t, q.manager, 4); strings.Join(got, ",") != "healthy,healthy,healthy,healthy" {
-		t.Fatalf("served after the poll = %v, want only healthy (exhausted is at weekly_all 100 despite Fable 40)", got)
+	q.respond("healthy", "claude-fable-5", unifiedHeaders(time.Now(), "0.10", "0.55", "0.40", "allowed"))
+	q.respond("fable-out", "claude-fable-5", unifiedHeaders(time.Now(), "0.10", "0.55", "1.02", "rejected"))
+	if got := executor.serve(t, q.manager, "claude-fable-5", 4); strings.Join(got, ",") != "healthy,healthy,healthy,healthy" {
+		t.Fatalf("served Fable after signals = %v, want only healthy", got)
 	}
-	if got := upstream.total(); got != before {
-		t.Fatalf("usage requests during routing = %d, want none", got-before)
+	if got := executor.serve(t, q.manager, "claude-sonnet-4-5", 4); !strings.Contains(strings.Join(got, ","), "fable-out") {
+		t.Fatalf("served sonnet after signals = %v, want fable-out still in rotation", got)
 	}
 }
 
 func TestDialGuardCatchesAnthropicHost(t *testing.T) {
 	restore := installDialGuard()
-	target, _ := url.Parse(claudequota.UsageEndpoint(&config.Config{}))
-	_, err := (&net.Dialer{}).DialContext(context.Background(), "tcp", target.Host+":443")
+	_, err := (&net.Dialer{}).DialContext(context.Background(), "tcp", "api.anthropic.com:443")
 	if attempts := restore(); err == nil || len(attempts) == 0 {
-		t.Fatalf("dial %s: err=%v attempts=%v, want the guard to refuse it", target.Host, err, attempts)
+		t.Fatalf("dial api.anthropic.com: err=%v attempts=%v, want the guard to refuse it", err, attempts)
 	}
 }

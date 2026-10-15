@@ -605,62 +605,6 @@ func TestFetchOAuthProfile(t *testing.T) {
 	}
 }
 
-func TestFetchOAuthUsageSendsBetaHeaderAndReturnsBody(t *testing.T) {
-	const endpoint = "http://usage.test/api/oauth/usage"
-	auth := &ClaudeAuth{
-		httpClient: &http.Client{
-			Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
-				if req.Method != http.MethodGet || req.URL.String() != endpoint {
-					t.Fatalf("usage request = %s %s, want GET %s", req.Method, req.URL, endpoint)
-				}
-				if got := req.Header.Get("Authorization"); got != "Bearer test-access" {
-					t.Fatalf("Authorization = %q, want bearer token", got)
-				}
-				if got := req.Header.Get("anthropic-beta"); got != "oauth-2025-04-20" {
-					t.Fatalf("anthropic-beta = %q, want oauth-2025-04-20", got)
-				}
-				return &http.Response{
-					StatusCode: http.StatusOK,
-					Body:       io.NopCloser(strings.NewReader(`{"limits":[]}`)),
-					Header:     make(http.Header),
-					Request:    req,
-				}, nil
-			}),
-		},
-	}
-
-	body, errUsage := auth.FetchOAuthUsage(context.Background(), endpoint, "test-access")
-	if errUsage != nil {
-		t.Fatalf("FetchOAuthUsage() error = %v", errUsage)
-	}
-	if string(body) != `{"limits":[]}` {
-		t.Fatalf("body = %s, want upstream body", body)
-	}
-}
-
-func TestFetchOAuthUsageReportsStatusWithoutToken(t *testing.T) {
-	auth := &ClaudeAuth{
-		httpClient: &http.Client{
-			Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
-				return &http.Response{
-					StatusCode: http.StatusUnauthorized,
-					Body:       io.NopCloser(strings.NewReader(`{"error":"bad token"}`)),
-					Header:     make(http.Header),
-					Request:    req,
-				}, nil
-			}),
-		},
-	}
-
-	_, errUsage := auth.FetchOAuthUsage(context.Background(), UsageURL, "secret-access-value")
-	if errUsage == nil {
-		t.Fatal("FetchOAuthUsage() error = nil, want status error")
-	}
-	if !strings.Contains(errUsage.Error(), "401") || strings.Contains(errUsage.Error(), "secret-access-value") {
-		t.Fatalf("error = %q, want status 401 without token", errUsage)
-	}
-}
-
 func TestUpdateTokenStoragePreservesAccountWhenRefreshOmitsIt(t *testing.T) {
 	storage := &ClaudeTokenStorage{
 		Email:            "user@example.com",

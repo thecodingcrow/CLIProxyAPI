@@ -9,7 +9,6 @@ import (
 const (
 	StatePending  = "pending"
 	StateOK       = "ok"
-	StateError    = "error"
 	StateDisabled = "disabled"
 )
 
@@ -17,18 +16,16 @@ const (
 // over accounts with data, assuming equal plan capacity per account.
 const AveragingMean = "mean"
 
-// Snapshot is the cached quota view of every Claude OAuth credential.
+// Snapshot is the observed quota view of every Claude OAuth credential.
 type Snapshot struct {
-	// Enabled is false while polling is off; accounts are then empty.
+	// Enabled is always true: the source is passive.
 	Enabled     bool      `json:"enabled"`
 	GeneratedAt time.Time `json:"generated_at"`
-	// RefreshIntervalSeconds is the effective poll interval; 0 while disabled.
-	RefreshIntervalSeconds int       `json:"refresh_interval_seconds"`
-	Accounts               []Account `json:"accounts"`
-	Summary                Summary   `json:"summary"`
+	Accounts    []Account `json:"accounts"`
+	Summary     Summary   `json:"summary"`
 }
 
-// Account is one credential's cached limits.
+// Account is one credential's observed limits.
 type Account struct {
 	ID        string `json:"id"`
 	AuthIndex string `json:"auth_index"`
@@ -37,29 +34,24 @@ type Account struct {
 	Email     string `json:"email,omitempty"`
 	Disabled  bool   `json:"disabled"`
 	State     string `json:"state"`
-	// FetchedAt is the time of the last successful fetch.
-	FetchedAt *time.Time `json:"fetched_at"`
-	// NextPollAt is when the next upstream poll is scheduled; nil while paused.
-	NextPollAt *time.Time `json:"next_poll_at"`
-	// Stale is set when the last attempt failed or the value outlived two intervals.
-	Stale bool `json:"stale"`
-	// Refreshing is set while a fetch for this credential is in flight.
-	Refreshing    bool             `json:"refreshing"`
-	Error         string           `json:"error,omitempty"`
+	// ObservedAt is the newest response any reported window came from.
+	ObservedAt *time.Time `json:"observed_at"`
+	// Stale is set once a window outlived its reset; that window counts as reset.
+	Stale         bool             `json:"stale"`
 	CooldownUntil *time.Time       `json:"cooldown_until,omitempty"`
 	Session       *Limit           `json:"session"`
 	WeeklyAll     *Limit           `json:"weekly_all"`
 	WeeklyScoped  map[string]Limit `json:"weekly_scoped"`
-	// HasQuota is nil until the first successful fetch.
+	// HasQuota is nil until a window is observed.
 	HasQuota *HasQuota `json:"has_quota"`
 }
 
 // HasQuota is the derived availability of one account.
 type HasQuota struct {
-	// Any covers models without a scoped limit: session and weekly_all below
-	// 100% and no credential-wide quota cooldown.
+	// Any covers models without a scoped limit: session and weekly_all not
+	// exhausted and no credential-wide quota cooldown.
 	Any bool `json:"any"`
-	// Scoped additionally requires that scoped limit below 100%, keyed by display name.
+	// Scoped additionally requires that scoped limit not exhausted, keyed by display name.
 	Scoped map[string]bool `json:"scoped"`
 }
 
@@ -81,7 +73,6 @@ type SummaryAccounts struct {
 	Total    int `json:"total"`
 	WithData int `json:"with_data"`
 	Pending  int `json:"pending"`
-	Errored  int `json:"errored"`
 	Stale    int `json:"stale"`
 	// WithQuotaAny counts accounts that can serve models without a scoped limit.
 	WithQuotaAny int `json:"with_quota_any"`
@@ -101,50 +92,42 @@ type ScopedSummary struct {
 	Accounts int `json:"accounts"`
 }
 
-func (e *entry) account(now time.Time, interval time.Duration) Account {
+func account(cred Credential, now time.Time) Account {
 	account := Account{
-		ID:         e.cred.ID,
-		AuthIndex:  e.cred.Index,
-		Name:       e.cred.Name,
-		Label:      e.cred.Label,
-		Email:      e.cred.Email,
-		Disabled:   e.cred.Disabled,
-		Refreshing: e.inflight,
-		Error:      e.err,
+		ID:        cred.ID,
+		AuthIndex: cred.Index,
+		Name:      cred.Name,
+		Label:     cred.Label,
+		Email:     cred.Email,
+		Disabled:  cred.Disabled,
 	}
-	if !e.cred.Disabled && e.rejectedToken == "" {
-		nextAt := e.nextAt
-		account.NextPollAt = &nextAt
-	}
-	if e.cred.CooldownUntil.After(now) {
-		until := e.cred.CooldownUntil
+	if cred.CooldownUntil.After(now) {
+		until := cred.CooldownUntil
 		account.CooldownUntil = &until
 	}
+	usage := UsageFrom(cred.Observations)
 	switch {
-	case e.cred.Disabled:
+	case cred.Disabled:
 		account.State = StateDisabled
-	case e.err != "":
-		account.State = StateError
-	case e.usage == nil:
+	case usage == nil:
 		account.State = StatePending
 	default:
 		account.State = StateOK
 	}
-	if e.usage == nil {
-		account.Stale = e.err != ""
+	if usage == nil {
 		return account
 	}
-	fetchedAt := e.fetchedAt
-	account.FetchedAt = &fetchedAt
-	account.Stale = e.err != "" || now.Sub(e.fetchedAt) > staleAfterIntervals*interval
-	account.Session = e.usage.Session
-	account.WeeklyAll = e.usage.WeeklyAll
-	account.WeeklyScoped = e.usage.Scoped
+	observedAt := usage.observedAt()
+	account.ObservedAt = &observedAt
+	account.Stale = usage.stale(now)
+	account.Session = usage.Session
+	account.WeeklyAll = usage.WeeklyAll
+	account.WeeklyScoped = usage.Scoped
 
-	unscoped := !cooledDown(e.cred, now, nil) && e.usage.HasQuota("", now)
-	hasQuota := &HasQuota{Any: unscoped, Scoped: make(map[string]bool, len(e.usage.Scoped))}
-	for name, limit := range e.usage.Scoped {
-		modelCooled := cooledDown(e.cred, now, func(modelID string) bool { return ScopeMatchesModel(name, modelID) })
+	unscoped := !cooledDown(cred, now, nil) && usage.HasQuota("", now)
+	hasQuota := &HasQuota{Any: unscoped, Scoped: make(map[string]bool, len(usage.Scoped))}
+	for name, limit := range usage.Scoped {
+		modelCooled := cooledDown(cred, now, func(modelID string) bool { return ScopeMatchesModel(name, modelID) })
 		hasQuota.Scoped[name] = unscoped && !modelCooled && !limit.exhausted(now)
 	}
 	account.HasQuota = hasQuota
@@ -163,11 +146,8 @@ func summarize(accounts []Account, now time.Time) Summary {
 			continue
 		}
 		summary.Accounts.Total++
-		switch account.State {
-		case StatePending:
+		if account.State == StatePending {
 			summary.Accounts.Pending++
-		case StateError:
-			summary.Accounts.Errored++
 		}
 		if account.Stale {
 			summary.Accounts.Stale++
@@ -180,17 +160,19 @@ func summarize(accounts []Account, now time.Time) Summary {
 		if account.HasQuota.Any {
 			summary.Accounts.WithQuotaAny++
 		}
+		// Ended windows count as 0%; the account keeps the raw reading and stale.
 		weeklyPct := 0.0
 		if account.WeeklyAll != nil {
-			weeklyPct = account.WeeklyAll.Percent
+			weeklyPct = account.WeeklyAll.usedPercent(now)
 			weekly = append(weekly, weeklyPct)
 		}
 		if account.Session != nil {
-			session = append(session, account.Session.Percent)
+			session = append(session, account.Session.usedPercent(now))
 		}
 		for name, limit := range account.WeeklyScoped {
-			scopedUsed[name] = append(scopedUsed[name], limit.Percent)
-			scopedRemaining[name] = append(scopedRemaining[name], math.Max(0, 100-math.Max(limit.Percent, weeklyPct)))
+			used := limit.usedPercent(now)
+			scopedUsed[name] = append(scopedUsed[name], used)
+			scopedRemaining[name] = append(scopedRemaining[name], math.Max(0, 100-math.Max(used, weeklyPct)))
 		}
 		for _, limit := range accountLimits(account) {
 			if limit.ResetsAt != nil && limit.ResetsAt.After(now) && (summary.SoonestReset == nil || limit.ResetsAt.Before(*summary.SoonestReset)) {
