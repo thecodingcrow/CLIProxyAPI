@@ -93,7 +93,7 @@ func (a *Aggregator) quotaLocked(pool *claudequota.Pool, currentID int64, rows [
 	if pool == nil || pool.Accounts == 0 {
 		return nil
 	}
-	q := &Quota{Provider: quotaProvider, Accounts: pool.Accounts, Pooling: claudequota.AveragingMean, ObservedAt: pool.ObservedAt.UTC(), Stale: pool.Stale}
+	q := &Quota{Provider: quotaProvider, Accounts: pool.Accounts, Pooling: claudequota.AveragingMean, ObservedAt: pool.ObservedAt.UTC().Truncate(time.Second), Stale: pool.Stale}
 	q.WeeklyAll = a.windowLocked(pool.WeeklyAll, false, currentID)
 	q.Fable = a.windowLocked(pool.Fable, true, currentID)
 	if q.Fable != nil {
@@ -138,7 +138,7 @@ func (a *Aggregator) windowLocked(pooled claudequota.Pooled, fable bool, current
 		used += win.UsedPct
 		w.CostUSDMicros += cost
 		w.Accounts = append(w.Accounts, QuotaAccount{
-			AuthIndex: win.AuthIndex, UsedPct: win.UsedPct, WindowStart: start.UTC(), ResetsAt: win.ResetsAt.UTC(), CostUSDMicros: cost,
+			AuthIndex: win.AuthIndex, UsedPct: win.UsedPct, WindowStart: start.UTC().Truncate(time.Second), ResetsAt: win.ResetsAt.UTC().Truncate(time.Second), CostUSDMicros: cost,
 		})
 	}
 	if w.CostUSDMicros == 0 {
