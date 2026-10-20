@@ -11,7 +11,7 @@ var day = time.Date(2026, 10, 21, 12, 0, 0, 0, time.UTC)
 
 // Expected USD per MTok, copied from platform.claude.com/docs/en/about-claude/pricing on 2026-10-21.
 var official = []struct {
-	model                                   string
+	model                                 string
 	input, write5m, write1h, read, output float64
 }{
 	{"claude-fable-5-1", 10, 12.50, 20, 0.25, 50},
