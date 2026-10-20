@@ -52,7 +52,9 @@ type accountKey struct {
 	Fable     bool
 }
 
-func inFableScope(model string) bool { return claudequota.ScopeMatchesModel(claudequota.ScopeFable, model) }
+func inFableScope(model string) bool {
+	return claudequota.ScopeMatchesModel(claudequota.ScopeFable, model)
+}
 
 // addAccountCostLocked keeps the priced claude cost per credential; other providers have no plan quota.
 func (a *Aggregator) addAccountCostLocked(key Key, c Counters, authIndex string, currentID int64) {
