@@ -91,6 +91,9 @@ func checkModelUsageResponse(t *testing.T, rec *httptest.ResponseRecorder, provi
 	if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
 		t.Fatalf("decode: %v body=%s", err, rec.Body.String())
 	}
+	if strings.Contains(rec.Body.String(), `"quota"`) {
+		t.Fatalf("quota block without a quota store: %s", rec.Body.String())
+	}
 	if body.BucketSeconds != 600 || body.GeneratedAt == "" || body.Range != wantRange || body.Timezone == "" {
 		t.Fatalf("envelope: %s", rec.Body.String())
 	}

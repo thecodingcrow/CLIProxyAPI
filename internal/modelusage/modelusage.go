@@ -11,7 +11,9 @@ import (
 	"sync"
 	"time"
 
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/claudequota"
 	internallogging "github.com/router-for-me/CLIProxyAPI/v8/internal/logging"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/pricing"
 	coreauth "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/auth"
 	coresession "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/session"
 	coreusage "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/usage"
@@ -65,15 +67,21 @@ type Key struct {
 }
 
 // Counters are summed per bucket and per snapshot row.
-// Input includes cached tokens, output includes reasoning tokens, total = input + output.
+// Input includes cached tokens (cache reads plus writes), output includes reasoning tokens, total = input + output.
 type Counters struct {
-	Requests        int64 `json:"requests"`
-	Failed          int64 `json:"failed"`
-	InputTokens     int64 `json:"input_tokens"`
-	OutputTokens    int64 `json:"output_tokens"`
-	CachedTokens    int64 `json:"cached_tokens"`
-	ReasoningTokens int64 `json:"reasoning_tokens"`
-	TotalTokens     int64 `json:"total_tokens"`
+	Requests         int64 `json:"requests"`
+	Failed           int64 `json:"failed"`
+	InputTokens      int64 `json:"input_tokens"`
+	OutputTokens     int64 `json:"output_tokens"`
+	CachedTokens     int64 `json:"cached_tokens"`
+	ReasoningTokens  int64 `json:"reasoning_tokens"`
+	TotalTokens      int64 `json:"total_tokens"`
+	CacheWriteTokens int64 `json:"cache_write_tokens"`
+	// CostUSDMicros is the API-list-price equivalent of the priced requests.
+	CostUSDMicros    int64 `json:"cost_usd_micros"`
+	UnpricedRequests int64 `json:"unpriced_requests"`
+	// CostPartial marks counts loaded from an unpriced state file, priced without cache-write split or long-context tier.
+	CostPartial bool `json:"cost_partial,omitempty"`
 }
 
 func (c *Counters) add(o Counters) {
@@ -84,6 +92,10 @@ func (c *Counters) add(o Counters) {
 	c.CachedTokens += o.CachedTokens
 	c.ReasoningTokens += o.ReasoningTokens
 	c.TotalTokens += o.TotalTokens
+	c.CacheWriteTokens += o.CacheWriteTokens
+	c.CostUSDMicros += o.CostUSDMicros
+	c.UnpricedRequests += o.UnpricedRequests
+	c.CostPartial = c.CostPartial || o.CostPartial
 }
 
 // Row is one (provider, model, subagent) entry summed over the snapshot range.
@@ -92,6 +104,10 @@ type Row struct {
 	Model    string `json:"model"`
 	Subagent bool   `json:"subagent"`
 	Counters
+	// QuotaWeeklyPct is the cost times quota.weekly_all.pct_per_usd; claude rows only, when that block is present.
+	QuotaWeeklyPct *float64 `json:"quota_weekly_pct,omitempty"`
+	// QuotaFablePct is the cost times quota.fable.pct_per_usd; Fable-scope rows only.
+	QuotaFablePct *float64 `json:"quota_fable_pct,omitempty"`
 }
 
 // Snapshot is the management endpoint payload.
@@ -104,6 +120,8 @@ type Snapshot struct {
 	Timezone      string `json:"timezone"`
 	GeneratedAt   string `json:"generated_at"`
 	Models        []Row  `json:"models"`
+	// Quota is omitted without a quota store or without any account data.
+	Quota *Quota `json:"quota,omitempty"`
 }
 
 type bucket struct {
@@ -151,9 +169,11 @@ type Aggregator struct {
 	now     func() time.Time
 	maxKeys int
 	series  map[Key]*series
-	since   time.Time // first record ever counted, the start of RangeTotal
-	dirty   bool
-	path    string
+	// accounts holds the claude cost per credential, the share of each account's own quota window.
+	accounts map[accountKey]*series
+	since    time.Time // first record ever counted, the start of RangeTotal
+	dirty    bool
+	path     string
 
 	flushMu sync.Mutex
 	loopMu  sync.Mutex
@@ -169,7 +189,7 @@ func New(now func() time.Time, maxKeys int) *Aggregator {
 	if maxKeys <= 0 {
 		maxKeys = DefaultMaxKeys
 	}
-	return &Aggregator{now: now, maxKeys: maxKeys, series: make(map[Key]*series)}
+	return &Aggregator{now: now, maxKeys: maxKeys, series: make(map[Key]*series), accounts: make(map[accountKey]*series)}
 }
 
 var defaultAggregator = New(time.Now, DefaultMaxKeys)
@@ -185,12 +205,16 @@ func (a *Aggregator) HandleUsage(ctx context.Context, record coreusage.Record) {
 	if a == nil {
 		return
 	}
-	key, counters := fromRecord(ctx, record)
-	a.Add(key, counters)
+	key, counters := fromRecord(ctx, record, a.now())
+	a.add(key, counters, strings.TrimSpace(record.AuthIndex))
 }
 
 // Add records counters for key in the bucket of the current clock time.
 func (a *Aggregator) Add(key Key, counters Counters) {
+	a.add(key, counters, "")
+}
+
+func (a *Aggregator) add(key Key, counters Counters, authIndex string) {
 	if a == nil {
 		return
 	}
@@ -201,6 +225,7 @@ func (a *Aggregator) Add(key Key, counters Counters) {
 	s := a.seriesLocked(key)
 	s.add(currentID, counters, currentID)
 	s.total.add(counters)
+	a.addAccountCostLocked(key, counters, authIndex, currentID)
 	if a.since.IsZero() {
 		a.since = now
 	}
@@ -248,7 +273,10 @@ func (a *Aggregator) makeRoomLocked() {
 }
 
 // Snapshot sums each key over r; zero-request rows are omitted, order is total_tokens desc.
-func (a *Aggregator) Snapshot(r Range) Snapshot {
+func (a *Aggregator) Snapshot(r Range) Snapshot { return a.SnapshotWithQuota(r, nil) }
+
+// SnapshotWithQuota is Snapshot plus the quota block and row quota shares priced against pool; nil pool: none.
+func (a *Aggregator) SnapshotWithQuota(r Range, pool *claudequota.Pool) Snapshot {
 	if r == "" {
 		r = RangeWindow
 	}
@@ -300,6 +328,7 @@ func (a *Aggregator) Snapshot(r Range) Snapshot {
 		}
 		out.Models = append(out.Models, row)
 	}
+	out.Quota = a.quotaLocked(pool, currentID, out.Models)
 	sort.Slice(out.Models, func(i, j int) bool {
 		x, y := out.Models[i], out.Models[j]
 		if x.TotalTokens != y.TotalTokens {
@@ -339,7 +368,7 @@ func zoneName(loc *time.Location) string {
 }
 
 // fromRecord resolves session and failure the same way the Redis usage queue does.
-func fromRecord(ctx context.Context, record coreusage.Record) (Key, Counters) {
+func fromRecord(ctx context.Context, record coreusage.Record, now time.Time) (Key, Counters) {
 	provider := strings.ToLower(strings.TrimSpace(record.Provider))
 	// Compat executors report "openai-compatible-<name>"; the api-keys view groups them by compat name.
 	if compatName := strings.TrimPrefix(provider, openAICompatibleProviderPrefix); compatName != provider && compatName != "" {
@@ -374,30 +403,56 @@ func fromRecord(ctx context.Context, record coreusage.Record) (Key, Counters) {
 		failed = status >= 400
 	}
 
-	counters := tokenCounters(coreusage.EnsureTokenBreakdownForProvider(record.Detail, record.Provider, record.ExecutorType))
+	detail := coreusage.EnsureTokenBreakdownForProvider(record.Detail, record.Provider, record.ExecutorType)
+	counters := tokenCounters(detail)
 	counters.Requests = 1
+	at := record.RequestedAt
+	if at.IsZero() {
+		at = now
+	}
+	if cost, ok := requestCost(model, at, detail.TokenBreakdown); ok {
+		counters.CostUSDMicros = cost
+	} else {
+		counters.UnpricedRequests = 1
+	}
 	if failed {
 		counters.Failed = 1
 	}
 	return Key{Provider: provider, Model: model, Subagent: parentSessionID != ""}, counters
 }
 
+// requestCost prices only a complete breakdown with tokens; anything else carries no price, never a guess.
+// Usage records carry no 5m/1h cache-write split, so every write is priced at the 5m rate.
+func requestCost(model string, at time.Time, bd coreusage.TokenBreakdown) (int64, bool) {
+	if bd.Quality != coreusage.TokenAccountingQualityComplete || bd.TotalTokens == 0 {
+		return 0, false
+	}
+	return pricing.Default.Cost(model, at, pricing.Usage{
+		Input:        bd.Input.UncachedTokens,
+		CacheRead:    bd.Input.CacheReadTokens,
+		CacheWrite5m: bd.Input.CacheWriteTokens,
+		Output:       bd.Output.TotalTokens,
+	})
+}
+
 // tokenCounters prefers the normalised breakdown: raw Detail fields mean different things per provider.
 func tokenCounters(detail coreusage.Detail) Counters {
 	if bd := detail.TokenBreakdown; bd.Quality == coreusage.TokenAccountingQualityComplete {
 		return Counters{
-			InputTokens:     bd.Input.TotalTokens,
-			OutputTokens:    bd.Output.TotalTokens,
-			CachedTokens:    bd.Input.CacheReadTokens + bd.Input.CacheWriteTokens,
-			ReasoningTokens: bd.Output.ReasoningTokens,
-			TotalTokens:     bd.TotalTokens,
+			InputTokens:      bd.Input.TotalTokens,
+			OutputTokens:     bd.Output.TotalTokens,
+			CachedTokens:     bd.Input.CacheReadTokens + bd.Input.CacheWriteTokens,
+			ReasoningTokens:  bd.Output.ReasoningTokens,
+			TotalTokens:      bd.TotalTokens,
+			CacheWriteTokens: bd.Input.CacheWriteTokens,
 		}
 	}
 	return Counters{
-		InputTokens:     detail.InputTokens,
-		OutputTokens:    detail.OutputTokens,
-		CachedTokens:    detail.CacheReadTokens + detail.CacheCreationTokens,
-		ReasoningTokens: detail.ReasoningTokens,
-		TotalTokens:     detail.TotalTokens,
+		InputTokens:      detail.InputTokens,
+		OutputTokens:     detail.OutputTokens,
+		CachedTokens:     detail.CacheReadTokens + detail.CacheCreationTokens,
+		ReasoningTokens:  detail.ReasoningTokens,
+		TotalTokens:      detail.TotalTokens,
+		CacheWriteTokens: detail.CacheCreationTokens,
 	}
 }

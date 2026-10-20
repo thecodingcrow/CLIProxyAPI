@@ -142,12 +142,13 @@ func TestTokensNormalisedAcrossProviders(t *testing.T) {
 		name, provider                          string
 		detail                                  coreusage.Detail
 		input, output, cached, reasoning, total int64
+		cacheWrite                              int64
 	}{
 		{
 			// Claude input_tokens is uncached only; cache read and creation are separate.
 			name: "claude", provider: "claude",
 			detail: coreusage.Detail{InputTokens: 5, CacheReadTokens: 7, CacheCreationTokens: 3, OutputTokens: 5},
-			input:  15, output: 5, cached: 10, total: 20,
+			input:  15, output: 5, cached: 10, total: 20, cacheWrite: 3,
 		},
 		{
 			// OpenAI prompt_tokens already include cached tokens.
@@ -166,7 +167,8 @@ func TestTokensNormalisedAcrossProviders(t *testing.T) {
 			agg := New(newClock().Now, 0)
 			agg.HandleUsage(context.Background(), coreusage.Record{Provider: tc.provider, Model: "m", Detail: tc.detail})
 			got := findRow(t, agg.Snapshot(RangeWindow), tc.provider, "m", false)
-			want := Counters{Requests: 1, InputTokens: tc.input, OutputTokens: tc.output, CachedTokens: tc.cached, ReasoningTokens: tc.reasoning, TotalTokens: tc.total}
+			want := Counters{Requests: 1, InputTokens: tc.input, OutputTokens: tc.output, CachedTokens: tc.cached, ReasoningTokens: tc.reasoning, TotalTokens: tc.total,
+				CacheWriteTokens: tc.cacheWrite, UnpricedRequests: 1} // model "m" has no price
 			if got.Counters != want {
 				t.Fatalf("got %+v, want %+v", got.Counters, want)
 			}
