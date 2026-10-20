@@ -102,13 +102,17 @@ func (t Table) Cost(model string, at time.Time, u Usage) (int64, bool) {
 	if !ok {
 		return 0, false
 	}
-	p := e.Prices
 	if e.LongContext != nil && u.prompt() > e.LongContext.OverPromptTokens {
-		p = e.LongContext.Prices
+		return e.LongContext.Cost(u), true
 	}
+	return e.Prices.Cost(u), true
+}
+
+// Cost is u at p in µUSD, rounded once; no tier applies, so summed usage can be priced at base rates.
+func (p Prices) Cost(u Usage) int64 {
 	// tokens x µUSD/MTok is picoUSD: exact until the final rounding.
 	pico := u.Input*p.Input + u.CacheRead*p.CacheRead + u.CacheWrite5m*p.CacheWrite5m + u.CacheWrite1h*p.CacheWrite1h + u.Output*p.Output
-	return (pico + 500_000) / 1_000_000, true
+	return (pico + 500_000) / 1_000_000
 }
 
 var (

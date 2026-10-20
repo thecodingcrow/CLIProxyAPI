@@ -21,16 +21,17 @@ const (
 	FileName = "model-usage.state"
 	// FlushInterval is how often a dirty aggregator is written while persistence runs.
 	FlushInterval = 60 * time.Second
-	fileVersion   = 2
-	// fileVersionUnpriced predates cost counters; its counts load backfilled at list price.
-	fileVersionUnpriced = 1
+	// Cost fields are additive under version 1, so a binary without them still reads the file.
+	fileVersion = 1
 )
 
 type fileState struct {
-	Version int          `json:"version"`
-	Since   time.Time    `json:"since"`
-	Series  []fileSeries `json:"series"`
-	// Accounts is the claude cost per credential; v1 files have none.
+	Version int `json:"version"`
+	// Priced marks counters with cost fields; a file without it (older binary) loads backfilled at list price.
+	Priced bool         `json:"priced,omitempty"`
+	Since  time.Time    `json:"since"`
+	Series []fileSeries `json:"series"`
+	// Accounts is the claude cost per credential; unpriced files have none.
 	Accounts []fileAccount `json:"accounts,omitempty"`
 }
 
@@ -77,7 +78,7 @@ func (a *Aggregator) Open(path string) {
 	if errParse == nil {
 		errParse = json.Unmarshal(data, &state)
 	}
-	if errParse == nil && state.Version != fileVersion && state.Version != fileVersionUnpriced {
+	if errParse == nil && state.Version != fileVersion {
 		errParse = fmt.Errorf("unsupported version %d", state.Version)
 	}
 	if errParse != nil {
@@ -92,7 +93,7 @@ func (a *Aggregator) Open(path string) {
 	defer a.mu.Unlock()
 	currentID := coreauth.RecentRequestBucketID(a.now())
 	for _, fsr := range state.Series {
-		if state.Version == fileVersionUnpriced {
+		if !state.Priced {
 			backfill(&fsr, state.Since)
 		}
 		s := a.seriesLocked(Key{Provider: fsr.Provider, Model: fsr.Model, Subagent: fsr.Subagent})
@@ -125,7 +126,7 @@ func (a *Aggregator) Flush() error {
 		a.mu.Unlock()
 		return nil
 	}
-	state := fileState{Version: fileVersion, Since: a.since, Series: make([]fileSeries, 0, len(a.series))}
+	state := fileState{Version: fileVersion, Priced: true, Since: a.since, Series: make([]fileSeries, 0, len(a.series))}
 	currentID := coreauth.RecentRequestBucketID(a.now())
 	for key, s := range a.series {
 		s.prune(currentID) // idle keys get no write that would prune them
@@ -234,7 +235,7 @@ func (a *Aggregator) StopPersistence() {
 	}
 }
 
-// backfill prices v1 counters with the price valid on each bucket's day. v1 merged cache reads and writes
+// backfill prices unpriced counters with the price valid on each bucket's day. Unpriced files merge cache reads and writes
 // into cached_tokens, so all of it is priced as reads, and per-request long-context tiers are lost: partial.
 // Total history older than the buckets has no date and is priced at the tracking start.
 func backfill(fsr *fileSeries, since time.Time) {
@@ -262,14 +263,15 @@ func priceUnpriced(c *Counters, model string, at time.Time) {
 		return
 	}
 	c.CostPartial = true
-	cost, ok := pricing.Default.Cost(model, at, pricing.Usage{
-		Input:     max(0, c.InputTokens-c.CachedTokens),
-		CacheRead: max(0, c.CachedTokens),
-		Output:    max(0, c.OutputTokens),
-	})
+	entry, ok := pricing.Default.Lookup(model, at)
 	if !ok {
 		c.UnpricedRequests = c.Requests
 		return
 	}
-	c.CostUSDMicros = cost
+	// Base prices: a long-context tier is per request, and a sum of requests says nothing about one.
+	c.CostUSDMicros = entry.Prices.Cost(pricing.Usage{
+		Input:     max(0, c.InputTokens-c.CachedTokens),
+		CacheRead: max(0, c.CachedTokens),
+		Output:    max(0, c.OutputTokens),
+	})
 }

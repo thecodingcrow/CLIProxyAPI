@@ -80,7 +80,7 @@ type Counters struct {
 	// CostUSDMicros is the API-list-price equivalent of the priced requests.
 	CostUSDMicros    int64 `json:"cost_usd_micros"`
 	UnpricedRequests int64 `json:"unpriced_requests"`
-	// CostPartial marks counts loaded from a v1 state file, priced without cache-write split or long-context tier.
+	// CostPartial marks counts loaded from an unpriced state file, priced without cache-write split or long-context tier.
 	CostPartial bool `json:"cost_partial,omitempty"`
 }
 

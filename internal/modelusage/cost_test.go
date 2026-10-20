@@ -58,7 +58,34 @@ func TestRecordAddsExactCostPerModel(t *testing.T) {
 	}
 }
 
-func TestStateFileRoundTripsVersion2(t *testing.T) {
+// unpricedState is the state file as the binary before cost counters reads and rewrites it.
+type unpricedState struct {
+	Version int       `json:"version"`
+	Since   time.Time `json:"since"`
+	Series  []struct {
+		Provider string `json:"provider"`
+		Model    string `json:"model"`
+		Subagent bool   `json:"subagent"`
+		LastID   int64  `json:"last_id"`
+		Total    unpricedCounters
+		Buckets  []struct {
+			ID int64 `json:"id"`
+			unpricedCounters
+		} `json:"buckets"`
+	} `json:"series"`
+}
+
+type unpricedCounters struct {
+	Requests        int64 `json:"requests"`
+	Failed          int64 `json:"failed"`
+	InputTokens     int64 `json:"input_tokens"`
+	OutputTokens    int64 `json:"output_tokens"`
+	CachedTokens    int64 `json:"cached_tokens"`
+	ReasoningTokens int64 `json:"reasoning_tokens"`
+	TotalTokens     int64 `json:"total_tokens"`
+}
+
+func TestPricedStateRoundTripsAndSurvivesRollback(t *testing.T) {
 	path := filepath.Join(t.TempDir(), FileName)
 	clock := newClock()
 	before := New(clock.Now, 0)
@@ -67,14 +94,6 @@ func TestStateFileRoundTripsVersion2(t *testing.T) {
 	if err := before.Flush(); err != nil {
 		t.Fatal(err)
 	}
-	data, err := os.ReadFile(path)
-	if err != nil {
-		t.Fatal(err)
-	}
-	var head struct{ Version int }
-	if err := json.Unmarshal(data, &head); err != nil || head.Version != 2 {
-		t.Fatalf("version %d (%v), want 2", head.Version, err)
-	}
 	after := New(clock.Now, 0)
 	after.Open(path)
 	for _, r := range allRanges {
@@ -82,16 +101,62 @@ func TestStateFileRoundTripsVersion2(t *testing.T) {
 			t.Fatalf("%s after restart:\n got %+v\nwant %+v", r, got, want)
 		}
 	}
-	if row := findRow(t, after.Snapshot(RangeTotal), "claude", "claude-opus-5-5", false); row.CostUSDMicros != 33_000 {
+	if row := findRow(t, after.Snapshot(RangeTotal), "claude", "claude-opus-5-5", false); row.CostUSDMicros != 33_000 || row.CostPartial {
 		t.Fatalf("cost after restart: %+v", row.Counters)
+	}
+
+	// The binary before cost counters accepts only version 1 and keeps every bucket.
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var old unpricedState
+	if err := json.Unmarshal(data, &old); err != nil || old.Version != 1 || len(old.Series) != 1 ||
+		len(old.Series[0].Buckets) != 1 || old.Series[0].Buckets[0].Requests != 1 || old.Series[0].Total.TotalTokens != 24_500 {
+		t.Fatalf("read by the unpriced binary: %+v (%v)", old, err)
+	}
+	// Its next flush drops the cost fields; the priced binary then backfills them.
+	rewritten, err := json.Marshal(old)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, rewritten, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	back := New(clock.Now, 0)
+	back.Open(path)
+	// 1,000 uncached x $4 + 23,000 cached as reads x $0.20 + 500 x $20.
+	if row := findRow(t, back.Snapshot(Range7d), "claude", "claude-opus-5-5", false); row.CostUSDMicros != 18_600 || !row.CostPartial {
+		t.Fatalf("after rollback and return: %+v, want 18600 µUSD partial", row.Counters)
 	}
 }
 
-func TestVersion1StateBackfillsCostAsPartial(t *testing.T) {
+// The long-context tier is per request; summed history never reaches it.
+func TestBackfillPricesHaikuAtBaseTier(t *testing.T) {
+	path := filepath.Join(t.TempDir(), FileName)
+	clock := newClock()
+	id := strconv.FormatInt(clock.Now().Unix()/BucketSeconds, 10)
+	counts := `"requests":20,"input_tokens":200000,"total_tokens":200000`
+	v1 := `{"version":1,"since":"2026-09-01T00:00:00Z","series":[{"provider":"claude","model":"claude-haiku-5-5","last_id":` + id +
+		`,"total":{` + counts + `},"buckets":[{"id":` + id + `,` + counts + `}]}]}`
+	if err := os.WriteFile(path, []byte(v1), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	agg := New(clock.Now, 0)
+	agg.Open(path)
+	for _, r := range []Range{Range7d, RangeTotal} {
+		// 200,000 x $0.10, not the >100K row's $0.50.
+		if row := findRow(t, agg.Snapshot(r), "claude", "claude-haiku-5-5", false); row.CostUSDMicros != 20_000 {
+			t.Errorf("%s: %d µUSD, want 20000", r, row.CostUSDMicros)
+		}
+	}
+}
+
+func TestUnpricedStateBackfillsCostAsPartial(t *testing.T) {
 	path := filepath.Join(t.TempDir(), FileName)
 	clock := newClock()
 	id := clock.Now().Unix() / BucketSeconds
-	// v1 counters: input_tokens includes cached_tokens, which merges cache reads and writes.
+	// Unpriced counters: input_tokens includes cached_tokens, which merges cache reads and writes.
 	v1 := `{"version":1,"since":"2026-09-01T00:00:00Z","series":[
 	 {"provider":"claude","model":"claude-opus-5-5","subagent":false,"last_id":ID,
 	  "total":{"requests":3,"input_tokens":31000,"output_tokens":1500,"cached_tokens":20000,"total_tokens":32500},
