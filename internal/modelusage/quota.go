@@ -24,26 +24,33 @@ type Quota struct {
 	Stale      bool         `json:"stale"`
 }
 
-// QuotaWindow is one weekly window across accounts, each over its own window.
+// QuotaWindow is one weekly window across accounts, each since its own baseline.
 type QuotaWindow struct {
 	// UsedPct is the pooled mean.
 	UsedPct float64 `json:"used_pct"`
-	// CostUSDMicros sums the listed accounts' cost, each since its own window start.
+	// CostUSDMicros sums the listed accounts' cost since their baselines.
 	CostUSDMicros int64 `json:"cost_usd_micros"`
-	// PctPerUSD is the listed accounts' used percent summed, over all pooled accounts, per USD of their cost.
-	PctPerUSD float64        `json:"pct_per_usd"`
-	Accounts  []QuotaAccount `json:"accounts"`
+	// PctPerUSD is the listed accounts' utilization change summed, over all pooled accounts, per USD of their cost.
+	PctPerUSD float64 `json:"pct_per_usd"`
+	// AccountsInRate counts the listed accounts.
+	AccountsInRate int            `json:"accounts_in_rate"`
+	Accounts       []QuotaAccount `json:"accounts"`
 	// Models names the rows in the window's scope; Fable only.
 	Models []string `json:"models,omitempty"`
 }
 
-// QuotaAccount is one account with proxy cost in its running window.
+// QuotaAccount is one account whose utilization change since its baseline pairs with proxy cost.
 type QuotaAccount struct {
-	AuthIndex     string    `json:"auth_index"`
-	UsedPct       float64   `json:"used_pct"`
-	WindowStart   time.Time `json:"window_start"`
-	ResetsAt      time.Time `json:"resets_at"`
-	CostUSDMicros int64     `json:"cost_usd_micros"`
+	AuthIndex   string    `json:"auth_index"`
+	UsedPct     float64   `json:"used_pct"`
+	WindowStart time.Time `json:"window_start"`
+	ResetsAt    time.Time `json:"resets_at"`
+	// CostUSDMicros is the cost since BaselineAt.
+	CostUSDMicros   int64     `json:"cost_usd_micros"`
+	BaselineAt      time.Time `json:"baseline_at"`
+	BaselineUsedPct float64   `json:"baseline_used_pct"`
+	// Exact: the baseline is the window start, so the whole window's utilization pairs with its cost.
+	Exact bool `json:"exact"`
 }
 
 // accountKey is one credential's cost series: all claude models, or only the Fable scope.
@@ -56,36 +63,112 @@ func inFableScope(model string) bool {
 	return claudequota.ScopeMatchesModel(claudequota.ScopeFable, model)
 }
 
+// minDeltaPct is the smallest utilization change an inexact baseline rates: readings move in ~1-point steps.
+const minDeltaPct = 5
+
+// account is one credential's cost: 7 days of buckets, the cumulative total since costSince, and the
+// baseline its quota window is rated from.
+type account struct {
+	series
+	base *baseline
+}
+
+// baseline pairs one utilization reading with the account's cumulative cost at that moment.
+type baseline struct {
+	WindowStart time.Time `json:"window_start"`
+	ResetsAt    time.Time `json:"resets_at"`
+	UsedPct     float64   `json:"used_pct"`
+	// CostUSDMicros is the account's cumulative cost at At.
+	CostUSDMicros int64     `json:"cost_usd_micros"`
+	At            time.Time `json:"at"`
+	Exact         bool      `json:"exact"`
+}
+
 // addAccountCostLocked keeps the priced claude cost per credential; other providers have no plan quota.
 func (a *Aggregator) addAccountCostLocked(key Key, c Counters, authIndex string, currentID int64) {
 	if authIndex == "" || key.Provider != quotaProvider || c.CostUSDMicros <= 0 {
 		return
 	}
 	cost := Counters{CostUSDMicros: c.CostUSDMicros}
-	a.accountSeriesLocked(accountKey{AuthIndex: authIndex}).add(currentID, cost, currentID)
+	keys := []accountKey{{AuthIndex: authIndex}}
 	if inFableScope(key.Model) {
-		a.accountSeriesLocked(accountKey{AuthIndex: authIndex, Fable: true}).add(currentID, cost, currentID)
+		keys = append(keys, accountKey{AuthIndex: authIndex, Fable: true})
+	}
+	for _, k := range keys {
+		acc := a.accountLocked(k)
+		acc.add(currentID, cost, currentID)
+		acc.total.add(cost)
 	}
 }
 
-// accountSeriesLocked drops the least recently active credential at the key cap: counts there are only a rate input.
-func (a *Aggregator) accountSeriesLocked(key accountKey) *series {
-	if s, ok := a.accounts[key]; ok {
-		return s
+// accountLocked drops the least recently active credential at the key cap: counts there are only a rate input.
+func (a *Aggregator) accountLocked(key accountKey) *account {
+	if acc, ok := a.accounts[key]; ok {
+		return acc
 	}
 	for len(a.accounts) >= a.maxKeys {
 		var oldest accountKey
-		var victim *series
-		for k, s := range a.accounts {
-			if victim == nil || s.lastID < victim.lastID {
-				oldest, victim = k, s
+		var victim *account
+		for k, acc := range a.accounts {
+			if victim == nil || acc.lastID < victim.lastID {
+				oldest, victim = k, acc
 			}
 		}
 		delete(a.accounts, oldest)
 	}
-	s := &series{}
-	a.accounts[key] = s
-	return s
+	acc := &account{}
+	a.accounts[key] = acc
+	return acc
+}
+
+// costAt is the cumulative cost before the first bucket starting at or after at.
+func (acc *account) costAt(at time.Time, currentID int64) int64 {
+	return acc.total.CostUSDMicros - acc.sumSince(at, currentID).CostUSDMicros
+}
+
+// sameWindow tolerates reset timestamps jittering between responses; a new window moves them by days.
+func (b *baseline) sameWindow(resetsAt time.Time) bool {
+	return b != nil && b.ResetsAt.Sub(resetsAt).Abs() <= time.Hour
+}
+
+// observeQuotaLocked keeps the first reading of each window that tracking did not cover from its start,
+// paired with the cumulative cost including the request that carried it. Covered windows need no reading.
+func (a *Aggregator) observeQuotaLocked(authIndex string, reading *claudequota.Usage, currentID int64) {
+	if reading == nil {
+		return
+	}
+	observe := func(key accountKey, limit *claudequota.Limit) {
+		if limit == nil || limit.ResetsAt == nil {
+			return
+		}
+		acc := a.accountLocked(key)
+		if acc.base.sameWindow(*limit.ResetsAt) {
+			return
+		}
+		start := limit.ResetsAt.Add(-quotaWindow)
+		acc.base = nil
+		if a.costSince.After(start) {
+			acc.base = &baseline{WindowStart: start, ResetsAt: *limit.ResetsAt, UsedPct: limit.Percent,
+				CostUSDMicros: acc.total.CostUSDMicros, At: limit.ObservedAt}
+		}
+	}
+	observe(accountKey{AuthIndex: authIndex}, reading.WeeklyAll)
+	if fable, ok := reading.Scoped[claudequota.ScopeFable]; ok {
+		observe(accountKey{AuthIndex: authIndex, Fable: true}, &fable)
+	}
+}
+
+// baselineFor is win's baseline without changing state: exact (0%, cost at the window start) when tracking
+// covered the start, else the recorded first reading; false when there is neither.
+func (a *Aggregator) baselineFor(acc *account, win claudequota.AccountWindow, currentID int64) (baseline, bool) {
+	start := win.ResetsAt.Add(-quotaWindow)
+	if !a.costSince.After(start) {
+		return baseline{WindowStart: start, ResetsAt: win.ResetsAt, CostUSDMicros: acc.costAt(start, currentID), At: start, Exact: true}, true
+	}
+	if acc.base.sameWindow(win.ResetsAt) {
+		return *acc.base, true
+	}
+	return baseline{}, false
 }
 
 // quotaLocked builds the quota block and sets each row's quota share; nil without pool data.
@@ -93,7 +176,7 @@ func (a *Aggregator) quotaLocked(pool *claudequota.Pool, currentID int64, rows [
 	if pool == nil || pool.Accounts == 0 {
 		return nil
 	}
-	q := &Quota{Provider: quotaProvider, Accounts: pool.Accounts, Pooling: claudequota.AveragingMean, ObservedAt: pool.ObservedAt.UTC().Truncate(time.Second), Stale: pool.Stale}
+	q := &Quota{Provider: quotaProvider, Accounts: pool.Accounts, Pooling: claudequota.AveragingMean, ObservedAt: utcSecond(pool.ObservedAt), Stale: pool.Stale}
 	q.WeeklyAll = a.windowLocked(pool.WeeklyAll, false, currentID)
 	q.Fable = a.windowLocked(pool.Fable, true, currentID)
 	if q.Fable != nil {
@@ -117,8 +200,8 @@ func (a *Aggregator) quotaLocked(pool *claudequota.Pool, currentID int64, rows [
 	return q
 }
 
-// windowLocked sums each running account window's cost. Accounts without cost there spent only outside
-// the proxy and leave the sum, but the pool still divides by every account: the rate stays a share of the pool.
+// windowLocked rates utilization change per USD since each baseline, as a share of the whole pool; an account
+// with spend in the window but no usable change withholds it, since rows carry that spend.
 func (a *Aggregator) windowLocked(pooled claudequota.Pooled, fable bool, currentID int64) *QuotaWindow {
 	if pooled.Pooled == 0 {
 		return nil
@@ -126,27 +209,42 @@ func (a *Aggregator) windowLocked(pooled claudequota.Pooled, fable bool, current
 	w := &QuotaWindow{UsedPct: pooled.UsedPct, Accounts: []QuotaAccount{}}
 	var used float64
 	for _, win := range pooled.Windows {
-		start := win.ResetsAt.Add(-quotaWindow)
-		s, ok := a.accounts[accountKey{AuthIndex: win.AuthIndex, Fable: fable}]
+		acc, ok := a.accounts[accountKey{AuthIndex: win.AuthIndex, Fable: fable}]
 		if !ok {
 			continue
 		}
-		cost := s.sumSince(start, currentID).CostUSDMicros
-		if cost <= 0 {
+		b, ok := a.baselineFor(acc, win, currentID)
+		deltaUsed, deltaCost := win.UsedPct-b.UsedPct, acc.total.CostUSDMicros-b.CostUSDMicros
+		if !ok || deltaCost <= 0 || (!b.Exact && deltaUsed < minDeltaPct) {
+			// Rows carry this account's spend too; rating it at the others' rate would inflate every row.
+			if acc.sumSince(maxTime(win.ResetsAt.Add(-quotaWindow), a.costSince), currentID).CostUSDMicros > 0 {
+				return nil
+			}
 			continue
 		}
-		used += win.UsedPct
-		w.CostUSDMicros += cost
+		used += deltaUsed
+		w.CostUSDMicros += deltaCost
 		w.Accounts = append(w.Accounts, QuotaAccount{
-			AuthIndex: win.AuthIndex, UsedPct: win.UsedPct, WindowStart: start.UTC().Truncate(time.Second), ResetsAt: win.ResetsAt.UTC().Truncate(time.Second), CostUSDMicros: cost,
+			AuthIndex: win.AuthIndex, UsedPct: win.UsedPct, WindowStart: utcSecond(b.WindowStart), ResetsAt: utcSecond(win.ResetsAt),
+			CostUSDMicros: deltaCost, BaselineAt: utcSecond(b.At), BaselineUsedPct: b.UsedPct, Exact: b.Exact,
 		})
 	}
 	if w.CostUSDMicros == 0 {
 		return nil
 	}
+	w.AccountsInRate = len(w.Accounts)
 	w.PctPerUSD = used / float64(pooled.Pooled) / (float64(w.CostUSDMicros) / 1e6)
 	return w
 }
+
+func maxTime(x, y time.Time) time.Time {
+	if x.After(y) {
+		return x
+	}
+	return y
+}
+
+func utcSecond(t time.Time) time.Time { return t.UTC().Truncate(time.Second) }
 
 // sumSince counts buckets starting at or after since, up to currentID.
 func (s *series) sumSince(since time.Time, currentID int64) Counters {

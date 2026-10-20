@@ -28,6 +28,8 @@ type AccountWindow struct {
 	AuthIndex string
 	UsedPct   float64
 	ResetsAt  time.Time
+	// ObservedAt is when the response carrying this reading arrived.
+	ObservedAt time.Time
 }
 
 // Pool derives the pooled weekly windows at the snapshot's time.
@@ -68,5 +70,5 @@ func (p *Pooled) add(authIndex string, limit *Limit, now time.Time) {
 	if limit.ResetsAt == nil || limit.outlived(now) {
 		return
 	}
-	p.Windows = append(p.Windows, AccountWindow{AuthIndex: authIndex, UsedPct: limit.usedPercent(now), ResetsAt: *limit.ResetsAt})
+	p.Windows = append(p.Windows, AccountWindow{AuthIndex: authIndex, UsedPct: limit.usedPercent(now), ResetsAt: *limit.ResetsAt, ObservedAt: limit.ObservedAt})
 }

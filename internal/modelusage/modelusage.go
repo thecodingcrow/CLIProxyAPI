@@ -170,10 +170,12 @@ type Aggregator struct {
 	maxKeys int
 	series  map[Key]*series
 	// accounts holds the claude cost per credential, the share of each account's own quota window.
-	accounts map[accountKey]*series
-	since    time.Time // first record ever counted, the start of RangeTotal
-	dirty    bool
-	path     string
+	accounts map[accountKey]*account
+	// costSince starts per-account cost tracking: account cost before it is unknown, not zero.
+	costSince time.Time
+	since     time.Time // first record ever counted, the start of RangeTotal
+	dirty     bool
+	path      string
 
 	flushMu sync.Mutex
 	loopMu  sync.Mutex
@@ -189,7 +191,7 @@ func New(now func() time.Time, maxKeys int) *Aggregator {
 	if maxKeys <= 0 {
 		maxKeys = DefaultMaxKeys
 	}
-	return &Aggregator{now: now, maxKeys: maxKeys, series: make(map[Key]*series), accounts: make(map[accountKey]*series)}
+	return &Aggregator{now: now, maxKeys: maxKeys, series: make(map[Key]*series), accounts: make(map[accountKey]*account), costSince: now()}
 }
 
 var defaultAggregator = New(time.Now, DefaultMaxKeys)
@@ -206,15 +208,20 @@ func (a *Aggregator) HandleUsage(ctx context.Context, record coreusage.Record) {
 		return
 	}
 	key, counters := fromRecord(ctx, record, a.now())
-	a.add(key, counters, strings.TrimSpace(record.AuthIndex))
+	authIndex := strings.TrimSpace(record.AuthIndex)
+	var reading *claudequota.Usage // parsed outside the lock
+	if authIndex != "" && key.Provider == quotaProvider && counters.CostUSDMicros > 0 && len(record.ResponseHeaders) > 0 {
+		reading = claudequota.UsageFromHeaders(record.ResponseHeaders, a.now())
+	}
+	a.add(key, counters, authIndex, reading)
 }
 
 // Add records counters for key in the bucket of the current clock time.
 func (a *Aggregator) Add(key Key, counters Counters) {
-	a.add(key, counters, "")
+	a.add(key, counters, "", nil)
 }
 
-func (a *Aggregator) add(key Key, counters Counters, authIndex string) {
+func (a *Aggregator) add(key Key, counters Counters, authIndex string, reading *claudequota.Usage) {
 	if a == nil {
 		return
 	}
@@ -226,6 +233,7 @@ func (a *Aggregator) add(key Key, counters Counters, authIndex string) {
 	s.add(currentID, counters, currentID)
 	s.total.add(counters)
 	a.addAccountCostLocked(key, counters, authIndex, currentID)
+	a.observeQuotaLocked(authIndex, reading, currentID)
 	if a.since.IsZero() {
 		a.since = now
 	}

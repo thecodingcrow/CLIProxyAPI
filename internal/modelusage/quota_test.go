@@ -88,8 +88,8 @@ func TestPreviousWeekSpendStaysOutOfTheAccountsWindow(t *testing.T) {
 	q := agg.SnapshotWithQuota(Range7d, &pool).Quota
 	end := clock.Now()
 	want := []QuotaAccount{
-		{AuthIndex: "ia", UsedPct: 27, WindowStart: end.Add(-day), ResetsAt: end.Add(6 * day), CostUSDMicros: 18_000},
-		{AuthIndex: "ib", UsedPct: 100, WindowStart: end.Add(-6 * day), ResetsAt: end.Add(day), CostUSDMicros: 2100},
+		{AuthIndex: "ia", UsedPct: 27, WindowStart: end.Add(-day), ResetsAt: end.Add(6 * day), CostUSDMicros: 18_000, BaselineAt: end.Add(-day), Exact: true},
+		{AuthIndex: "ib", UsedPct: 100, WindowStart: end.Add(-6 * day), ResetsAt: end.Add(day), CostUSDMicros: 2100, BaselineAt: end.Add(-6 * day), Exact: true},
 	}
 	if q.WeeklyAll.CostUSDMicros != 20_100 || len(q.WeeklyAll.Accounts) != 2 || q.WeeklyAll.Accounts[0] != want[0] || q.WeeklyAll.Accounts[1] != want[1] {
 		t.Fatalf("weekly_all %+v, want accounts %+v", q.WeeklyAll, want)
