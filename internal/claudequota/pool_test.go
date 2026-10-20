@@ -30,10 +30,10 @@ func TestPoolListsEachAccountsRunningWeeklyWindow(t *testing.T) {
 		ObservedAt: now,
 		Stale:      true,
 		WeeklyAll: Pooled{UsedPct: 42.33, Pooled: 3, Windows: []AccountWindow{
-			{AuthIndex: "ia", UsedPct: 27, ResetsAt: resetA},
-			{AuthIndex: "ib", UsedPct: 100, ResetsAt: resetB},
+			{AuthIndex: "ia", UsedPct: 27, ResetsAt: resetA, ObservedAt: now},
+			{AuthIndex: "ib", UsedPct: 100, ResetsAt: resetB, ObservedAt: now.Add(-time.Hour)},
 		}},
-		Fable: Pooled{UsedPct: 10, Pooled: 1, Windows: []AccountWindow{{AuthIndex: "ia", UsedPct: 10, ResetsAt: resetFable}}},
+		Fable: Pooled{UsedPct: 10, Pooled: 1, Windows: []AccountWindow{{AuthIndex: "ia", UsedPct: 10, ResetsAt: resetFable, ObservedAt: now}}},
 	}
 	if !reflect.DeepEqual(pool, want) {
 		t.Fatalf("pool\n got %+v\nwant %+v", pool, want)
