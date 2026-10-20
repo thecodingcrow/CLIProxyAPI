@@ -185,3 +185,47 @@ func TestReadNeverMutatesState(t *testing.T) {
 		t.Fatalf("read changed state:\nbefore %+v (dirty %v)\nafter  %+v (dirty %v)", before, dirty, after, dirtyAfter)
 	}
 }
+
+// A busy account outside the rate would put its spend on every row at the other accounts' rate.
+func TestAccountWithCostOutsideTheRateWithholdsIt(t *testing.T) {
+	clock := newClock()
+	agg := New(clock.Now, 0)
+	resetsA := clock.Now().Add(6 * day)                                                             // window started before tracking: inexact
+	resetsB := clock.Now().Add(7*day + time.Hour)                                                   // window starts an hour into tracking: exact
+	opusRead(agg, 1000, 28, resetsA)                                                                // A's baseline
+	clock.Advance(4 * time.Hour)                                                                    // the baseline request leaves RangeWindow
+	opusRead(agg, 10_000_000, 31, resetsA)                                                          // $40 on A, 3 points: not yet in the rate
+	agg.HandleUsage(context.Background(), claudeRecord("claude-haiku-5-5", "ib", 100_000, 0, 0, 0)) // $0.01 on B
+	pool := func(usedA float64) *claudequota.Pool {
+		return &claudequota.Pool{Accounts: 2, ObservedAt: clock.Now(), WeeklyAll: claudequota.Pooled{UsedPct: (usedA + 30) / 2, Pooled: 2,
+			Windows: []claudequota.AccountWindow{
+				{AuthIndex: "ia", UsedPct: usedA, ResetsAt: resetsA, ObservedAt: clock.Now()},
+				{AuthIndex: "ib", UsedPct: 30, ResetsAt: resetsB, ObservedAt: clock.Now()},
+			}}}
+	}
+	snap := agg.SnapshotWithQuota(RangeWindow, pool(31))
+	if snap.Quota.WeeklyAll != nil {
+		t.Fatalf("A spent outside the rate: %+v, want weekly_all omitted", snap.Quota.WeeklyAll)
+	}
+	for _, row := range snap.Models {
+		if row.QuotaWeeklyPct != nil {
+			t.Fatalf("row %s carries %v without a rate", row.Model, *row.QuotaWeeklyPct)
+		}
+	}
+
+	snap = agg.SnapshotWithQuota(RangeWindow, pool(34))
+	w := snap.Quota.WeeklyAll
+	if w == nil || w.AccountsInRate != 2 {
+		t.Fatalf("A past 5 points: %+v, want both accounts in the rate", w)
+	}
+	pooledDelta := (34.0 - 28 + 30) / 2
+	var sum float64
+	for _, row := range snap.Models {
+		if row.QuotaWeeklyPct != nil {
+			sum += *row.QuotaWeeklyPct
+		}
+	}
+	if sum > pooledDelta+1e-6 {
+		t.Fatalf("rows sum to %v%%, more than the pooled change %v%%", sum, pooledDelta)
+	}
+}

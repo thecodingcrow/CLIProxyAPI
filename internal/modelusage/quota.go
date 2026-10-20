@@ -200,8 +200,8 @@ func (a *Aggregator) quotaLocked(pool *claudequota.Pool, currentID int64, rows [
 	return q
 }
 
-// windowLocked rates each account's utilization change against its cost, both since its baseline.
-// Accounts without both leave the sum, but the pool still divides by every account: the rate stays a share of the pool.
+// windowLocked rates utilization change per USD since each baseline, as a share of the whole pool; an account
+// with spend in the window but no usable change withholds it, since rows carry that spend.
 func (a *Aggregator) windowLocked(pooled claudequota.Pooled, fable bool, currentID int64) *QuotaWindow {
 	if pooled.Pooled == 0 {
 		return nil
@@ -214,11 +214,12 @@ func (a *Aggregator) windowLocked(pooled claudequota.Pooled, fable bool, current
 			continue
 		}
 		b, ok := a.baselineFor(acc, win, currentID)
-		if !ok {
-			continue
-		}
 		deltaUsed, deltaCost := win.UsedPct-b.UsedPct, acc.total.CostUSDMicros-b.CostUSDMicros
-		if deltaCost <= 0 || (!b.Exact && deltaUsed < minDeltaPct) {
+		if !ok || deltaCost <= 0 || (!b.Exact && deltaUsed < minDeltaPct) {
+			// Rows carry this account's spend too; rating it at the others' rate would inflate every row.
+			if acc.sumSince(maxTime(win.ResetsAt.Add(-quotaWindow), a.costSince), currentID).CostUSDMicros > 0 {
+				return nil
+			}
 			continue
 		}
 		used += deltaUsed
@@ -234,6 +235,13 @@ func (a *Aggregator) windowLocked(pooled claudequota.Pooled, fable bool, current
 	w.AccountsInRate = len(w.Accounts)
 	w.PctPerUSD = used / float64(pooled.Pooled) / (float64(w.CostUSDMicros) / 1e6)
 	return w
+}
+
+func maxTime(x, y time.Time) time.Time {
+	if x.After(y) {
+		return x
+	}
+	return y
 }
 
 func utcSecond(t time.Time) time.Time { return t.UTC().Truncate(time.Second) }
