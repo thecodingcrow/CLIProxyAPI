@@ -170,10 +170,12 @@ type Aggregator struct {
 	maxKeys int
 	series  map[Key]*series
 	// accounts holds the claude cost per credential, the share of each account's own quota window.
-	accounts map[accountKey]*series
-	since    time.Time // first record ever counted, the start of RangeTotal
-	dirty    bool
-	path     string
+	accounts map[accountKey]*account
+	// costSince starts per-account cost tracking: account cost before it is unknown, not zero.
+	costSince time.Time
+	since     time.Time // first record ever counted, the start of RangeTotal
+	dirty     bool
+	path      string
 
 	flushMu sync.Mutex
 	loopMu  sync.Mutex
@@ -189,7 +191,7 @@ func New(now func() time.Time, maxKeys int) *Aggregator {
 	if maxKeys <= 0 {
 		maxKeys = DefaultMaxKeys
 	}
-	return &Aggregator{now: now, maxKeys: maxKeys, series: make(map[Key]*series), accounts: make(map[accountKey]*series)}
+	return &Aggregator{now: now, maxKeys: maxKeys, series: make(map[Key]*series), accounts: make(map[accountKey]*account), costSince: now()}
 }
 
 var defaultAggregator = New(time.Now, DefaultMaxKeys)

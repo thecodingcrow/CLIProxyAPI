@@ -33,6 +33,8 @@ type fileState struct {
 	Series []fileSeries `json:"series"`
 	// Accounts is the claude cost per credential; unpriced files have none.
 	Accounts []fileAccount `json:"accounts,omitempty"`
+	// CostSince is the start of per-account cost tracking; older priced files lack it.
+	CostSince time.Time `json:"cost_since"`
 }
 
 type fileAccount struct {
@@ -40,6 +42,9 @@ type fileAccount struct {
 	Fable     bool     `json:"fable,omitempty"`
 	LastID    int64    `json:"last_id"`
 	Buckets   []bucket `json:"buckets"`
+	// TotalCostUSDMicros is cumulative since cost_since; absent in older files, where the buckets hold it all.
+	TotalCostUSDMicros int64     `json:"total_cost_usd_micros,omitempty"`
+	Baseline           *baseline `json:"baseline,omitempty"`
 }
 
 type fileSeries struct {
@@ -104,12 +109,26 @@ func (a *Aggregator) Open(path string) {
 		s.total.add(fsr.Total)
 		s.lastID = max(s.lastID, min(fsr.LastID, currentID))
 	}
+	trackedSince := state.CostSince
 	for _, fa := range state.Accounts {
-		s := a.accountSeriesLocked(accountKey{AuthIndex: fa.AuthIndex, Fable: fa.Fable})
+		acc := a.accountLocked(accountKey{AuthIndex: fa.AuthIndex, Fable: fa.Fable})
+		var sum int64
 		for _, b := range fa.Buckets {
-			s.add(min(b.ID, currentID), b.Counters, currentID)
+			acc.add(min(b.ID, currentID), b.Counters, currentID)
+			sum += b.CostUSDMicros
+			// Without cost_since, the oldest bucket is the latest tracking can have started.
+			if start := time.Unix(b.ID*BucketSeconds, 0); state.CostSince.IsZero() && (trackedSince.IsZero() || start.Before(trackedSince)) {
+				trackedSince = start
+			}
 		}
-		s.lastID = max(s.lastID, min(fa.LastID, currentID))
+		acc.total.CostUSDMicros += max(fa.TotalCostUSDMicros, sum)
+		acc.lastID = max(acc.lastID, min(fa.LastID, currentID))
+		if fa.Baseline != nil {
+			acc.base = fa.Baseline
+		}
+	}
+	if state.Priced && !trackedSince.IsZero() && trackedSince.Before(a.costSince) {
+		a.costSince = trackedSince
 	}
 	if !state.Since.IsZero() && (a.since.IsZero() || state.Since.Before(a.since)) {
 		a.since = state.Since
@@ -126,7 +145,7 @@ func (a *Aggregator) Flush() error {
 		a.mu.Unlock()
 		return nil
 	}
-	state := fileState{Version: fileVersion, Priced: true, Since: a.since, Series: make([]fileSeries, 0, len(a.series))}
+	state := fileState{Version: fileVersion, Priced: true, Since: a.since, CostSince: a.costSince, Series: make([]fileSeries, 0, len(a.series))}
 	currentID := coreauth.RecentRequestBucketID(a.now())
 	for key, s := range a.series {
 		s.prune(currentID) // idle keys get no write that would prune them
@@ -135,13 +154,17 @@ func (a *Aggregator) Flush() error {
 			LastID: s.lastID, Total: s.total, Buckets: s.buckets,
 		})
 	}
-	for key, s := range a.accounts {
-		s.prune(currentID)
-		if len(s.buckets) == 0 {
+	for key, acc := range a.accounts {
+		acc.prune(currentID)
+		// Idle 7 days with no running window: nothing left to rate.
+		if len(acc.buckets) == 0 && (acc.base == nil || !acc.base.ResetsAt.After(a.now())) {
 			delete(a.accounts, key)
 			continue
 		}
-		state.Accounts = append(state.Accounts, fileAccount{AuthIndex: key.AuthIndex, Fable: key.Fable, LastID: s.lastID, Buckets: s.buckets})
+		state.Accounts = append(state.Accounts, fileAccount{
+			AuthIndex: key.AuthIndex, Fable: key.Fable, LastID: acc.lastID, Buckets: acc.buckets,
+			TotalCostUSDMicros: acc.total.CostUSDMicros, Baseline: acc.base,
+		})
 	}
 	data, errMarshal := json.Marshal(state)
 	path := a.path

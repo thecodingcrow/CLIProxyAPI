@@ -95,20 +95,27 @@
       "used_pct": 63.5,
       "cost_usd_micros": 20100,
       "pct_per_usd": 3159.2039800995026,
+      "accounts_in_rate": 2,
       "accounts": [
         {
           "auth_index": "ia",
           "used_pct": 27,
           "window_start": "2025-02-24T21:20:00Z",
           "resets_at": "2025-03-03T21:20:00Z",
-          "cost_usd_micros": 18000
+          "cost_usd_micros": 18000,
+          "baseline_at": "2025-02-24T21:20:00Z",
+          "baseline_used_pct": 0,
+          "exact": true
         },
         {
           "auth_index": "ib",
           "used_pct": 100,
           "window_start": "2025-02-19T21:20:00Z",
           "resets_at": "2025-02-26T21:20:00Z",
-          "cost_usd_micros": 2100
+          "cost_usd_micros": 2100,
+          "baseline_at": "2025-02-19T21:20:00Z",
+          "baseline_used_pct": 0,
+          "exact": true
         }
       ]
     },
@@ -116,13 +123,17 @@
       "used_pct": 10,
       "cost_usd_micros": 10000,
       "pct_per_usd": 1000,
+      "accounts_in_rate": 1,
       "accounts": [
         {
           "auth_index": "ia",
           "used_pct": 10,
           "window_start": "2025-02-21T21:20:00Z",
           "resets_at": "2025-02-28T21:20:00Z",
-          "cost_usd_micros": 10000
+          "cost_usd_micros": 10000,
+          "baseline_at": "2025-02-21T21:20:00Z",
+          "baseline_used_pct": 0,
+          "exact": true
         }
       ],
       "models": [
