@@ -12,6 +12,7 @@ import (
 	"time"
 
 	internallogging "github.com/router-for-me/CLIProxyAPI/v8/internal/logging"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/pricing"
 	coreauth "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/auth"
 	coresession "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/session"
 	coreusage "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/usage"
@@ -65,15 +66,21 @@ type Key struct {
 }
 
 // Counters are summed per bucket and per snapshot row.
-// Input includes cached tokens, output includes reasoning tokens, total = input + output.
+// Input includes cached tokens (cache reads plus writes), output includes reasoning tokens, total = input + output.
 type Counters struct {
-	Requests        int64 `json:"requests"`
-	Failed          int64 `json:"failed"`
-	InputTokens     int64 `json:"input_tokens"`
-	OutputTokens    int64 `json:"output_tokens"`
-	CachedTokens    int64 `json:"cached_tokens"`
-	ReasoningTokens int64 `json:"reasoning_tokens"`
-	TotalTokens     int64 `json:"total_tokens"`
+	Requests         int64 `json:"requests"`
+	Failed           int64 `json:"failed"`
+	InputTokens      int64 `json:"input_tokens"`
+	OutputTokens     int64 `json:"output_tokens"`
+	CachedTokens     int64 `json:"cached_tokens"`
+	ReasoningTokens  int64 `json:"reasoning_tokens"`
+	TotalTokens      int64 `json:"total_tokens"`
+	CacheWriteTokens int64 `json:"cache_write_tokens"`
+	// CostUSDMicros is the API-list-price equivalent of the priced requests.
+	CostUSDMicros    int64 `json:"cost_usd_micros"`
+	UnpricedRequests int64 `json:"unpriced_requests"`
+	// CostPartial marks counts loaded from a v1 state file, priced without cache-write split or long-context tier.
+	CostPartial bool `json:"cost_partial,omitempty"`
 }
 
 func (c *Counters) add(o Counters) {
@@ -84,6 +91,10 @@ func (c *Counters) add(o Counters) {
 	c.CachedTokens += o.CachedTokens
 	c.ReasoningTokens += o.ReasoningTokens
 	c.TotalTokens += o.TotalTokens
+	c.CacheWriteTokens += o.CacheWriteTokens
+	c.CostUSDMicros += o.CostUSDMicros
+	c.UnpricedRequests += o.UnpricedRequests
+	c.CostPartial = c.CostPartial || o.CostPartial
 }
 
 // Row is one (provider, model, subagent) entry summed over the snapshot range.
@@ -185,7 +196,7 @@ func (a *Aggregator) HandleUsage(ctx context.Context, record coreusage.Record) {
 	if a == nil {
 		return
 	}
-	key, counters := fromRecord(ctx, record)
+	key, counters := fromRecord(ctx, record, a.now())
 	a.Add(key, counters)
 }
 
@@ -339,7 +350,7 @@ func zoneName(loc *time.Location) string {
 }
 
 // fromRecord resolves session and failure the same way the Redis usage queue does.
-func fromRecord(ctx context.Context, record coreusage.Record) (Key, Counters) {
+func fromRecord(ctx context.Context, record coreusage.Record, now time.Time) (Key, Counters) {
 	provider := strings.ToLower(strings.TrimSpace(record.Provider))
 	// Compat executors report "openai-compatible-<name>"; the api-keys view groups them by compat name.
 	if compatName := strings.TrimPrefix(provider, openAICompatibleProviderPrefix); compatName != provider && compatName != "" {
@@ -374,30 +385,56 @@ func fromRecord(ctx context.Context, record coreusage.Record) (Key, Counters) {
 		failed = status >= 400
 	}
 
-	counters := tokenCounters(coreusage.EnsureTokenBreakdownForProvider(record.Detail, record.Provider, record.ExecutorType))
+	detail := coreusage.EnsureTokenBreakdownForProvider(record.Detail, record.Provider, record.ExecutorType)
+	counters := tokenCounters(detail)
 	counters.Requests = 1
+	at := record.RequestedAt
+	if at.IsZero() {
+		at = now
+	}
+	if cost, ok := requestCost(model, at, detail.TokenBreakdown); ok {
+		counters.CostUSDMicros = cost
+	} else {
+		counters.UnpricedRequests = 1
+	}
 	if failed {
 		counters.Failed = 1
 	}
 	return Key{Provider: provider, Model: model, Subagent: parentSessionID != ""}, counters
 }
 
+// requestCost prices only a complete breakdown with tokens; anything else carries no price, never a guess.
+// Usage records carry no 5m/1h cache-write split, so every write is priced at the 5m rate.
+func requestCost(model string, at time.Time, bd coreusage.TokenBreakdown) (int64, bool) {
+	if bd.Quality != coreusage.TokenAccountingQualityComplete || bd.TotalTokens == 0 {
+		return 0, false
+	}
+	return pricing.Default.Cost(model, at, pricing.Usage{
+		Input:        bd.Input.UncachedTokens,
+		CacheRead:    bd.Input.CacheReadTokens,
+		CacheWrite5m: bd.Input.CacheWriteTokens,
+		Output:       bd.Output.TotalTokens,
+	})
+}
+
 // tokenCounters prefers the normalised breakdown: raw Detail fields mean different things per provider.
 func tokenCounters(detail coreusage.Detail) Counters {
 	if bd := detail.TokenBreakdown; bd.Quality == coreusage.TokenAccountingQualityComplete {
 		return Counters{
-			InputTokens:     bd.Input.TotalTokens,
-			OutputTokens:    bd.Output.TotalTokens,
-			CachedTokens:    bd.Input.CacheReadTokens + bd.Input.CacheWriteTokens,
-			ReasoningTokens: bd.Output.ReasoningTokens,
-			TotalTokens:     bd.TotalTokens,
+			InputTokens:      bd.Input.TotalTokens,
+			OutputTokens:     bd.Output.TotalTokens,
+			CachedTokens:     bd.Input.CacheReadTokens + bd.Input.CacheWriteTokens,
+			ReasoningTokens:  bd.Output.ReasoningTokens,
+			TotalTokens:      bd.TotalTokens,
+			CacheWriteTokens: bd.Input.CacheWriteTokens,
 		}
 	}
 	return Counters{
-		InputTokens:     detail.InputTokens,
-		OutputTokens:    detail.OutputTokens,
-		CachedTokens:    detail.CacheReadTokens + detail.CacheCreationTokens,
-		ReasoningTokens: detail.ReasoningTokens,
-		TotalTokens:     detail.TotalTokens,
+		InputTokens:      detail.InputTokens,
+		OutputTokens:     detail.OutputTokens,
+		CachedTokens:     detail.CacheReadTokens + detail.CacheCreationTokens,
+		ReasoningTokens:  detail.ReasoningTokens,
+		TotalTokens:      detail.TotalTokens,
+		CacheWriteTokens: detail.CacheCreationTokens,
 	}
 }

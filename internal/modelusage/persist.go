@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 	"time"
 
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/pricing"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/util"
 	coreauth "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/auth"
 	log "github.com/sirupsen/logrus"
@@ -20,7 +21,9 @@ const (
 	FileName = "model-usage.state"
 	// FlushInterval is how often a dirty aggregator is written while persistence runs.
 	FlushInterval = 60 * time.Second
-	fileVersion   = 1
+	fileVersion   = 2
+	// fileVersionUnpriced predates cost counters; its counts load backfilled at list price.
+	fileVersionUnpriced = 1
 )
 
 type fileState struct {
@@ -65,7 +68,7 @@ func (a *Aggregator) Open(path string) {
 	if errParse == nil {
 		errParse = json.Unmarshal(data, &state)
 	}
-	if errParse == nil && state.Version != fileVersion {
+	if errParse == nil && state.Version != fileVersion && state.Version != fileVersionUnpriced {
 		errParse = fmt.Errorf("unsupported version %d", state.Version)
 	}
 	if errParse != nil {
@@ -80,6 +83,9 @@ func (a *Aggregator) Open(path string) {
 	defer a.mu.Unlock()
 	currentID := coreauth.RecentRequestBucketID(a.now())
 	for _, fsr := range state.Series {
+		if state.Version == fileVersionUnpriced {
+			backfill(&fsr, state.Since)
+		}
 		s := a.seriesLocked(Key{Provider: fsr.Provider, Model: fsr.Model, Subagent: fsr.Subagent})
 		// IDs ahead of the clock (file written by a clock running ahead) count in the current bucket.
 		for _, b := range fsr.Buckets {
@@ -202,4 +208,44 @@ func (a *Aggregator) StopPersistence() {
 	if err := a.Flush(); err != nil {
 		log.WithError(err).Warn("model usage: final flush failed")
 	}
+}
+
+// backfill prices v1 counters with the price valid on each bucket's day. v1 merged cache reads and writes
+// into cached_tokens, so all of it is priced as reads, and per-request long-context tiers are lost: partial.
+// Total history older than the buckets has no date and is priced at the tracking start.
+func backfill(fsr *fileSeries, since time.Time) {
+	retained := Counters{}
+	for i := range fsr.Buckets {
+		b := &fsr.Buckets[i].Counters
+		retained.add(*b)
+		priceUnpriced(b, fsr.Model, time.Unix(fsr.Buckets[i].ID*BucketSeconds, 0))
+	}
+	older := fsr.Total
+	older.Requests -= retained.Requests
+	older.InputTokens -= retained.InputTokens
+	older.CachedTokens -= retained.CachedTokens
+	older.OutputTokens -= retained.OutputTokens
+	priceUnpriced(&older, fsr.Model, since)
+	priceUnpriced(&fsr.Total, fsr.Model, since) // flags the total and counts its unpriced requests
+	fsr.Total.CostUSDMicros = older.CostUSDMicros
+	for _, b := range fsr.Buckets {
+		fsr.Total.CostUSDMicros += b.CostUSDMicros
+	}
+}
+
+func priceUnpriced(c *Counters, model string, at time.Time) {
+	if c.Requests <= 0 {
+		return
+	}
+	c.CostPartial = true
+	cost, ok := pricing.Default.Cost(model, at, pricing.Usage{
+		Input:     max(0, c.InputTokens-c.CachedTokens),
+		CacheRead: max(0, c.CachedTokens),
+		Output:    max(0, c.OutputTokens),
+	})
+	if !ok {
+		c.UnpricedRequests = c.Requests
+		return
+	}
+	c.CostUSDMicros = cost
 }
