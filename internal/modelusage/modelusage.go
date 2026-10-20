@@ -11,6 +11,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/claudequota"
 	internallogging "github.com/router-for-me/CLIProxyAPI/v8/internal/logging"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/pricing"
 	coreauth "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/auth"
@@ -103,6 +104,10 @@ type Row struct {
 	Model    string `json:"model"`
 	Subagent bool   `json:"subagent"`
 	Counters
+	// QuotaWeeklyPct is the cost times quota.weekly_all.pct_per_usd; claude rows only, when that block is present.
+	QuotaWeeklyPct *float64 `json:"quota_weekly_pct,omitempty"`
+	// QuotaFablePct is the cost times quota.fable.pct_per_usd; Fable-scope rows only.
+	QuotaFablePct *float64 `json:"quota_fable_pct,omitempty"`
 }
 
 // Snapshot is the management endpoint payload.
@@ -115,6 +120,8 @@ type Snapshot struct {
 	Timezone      string `json:"timezone"`
 	GeneratedAt   string `json:"generated_at"`
 	Models        []Row  `json:"models"`
+	// Quota is omitted without a quota store or without any account data.
+	Quota *Quota `json:"quota,omitempty"`
 }
 
 type bucket struct {
@@ -162,9 +169,11 @@ type Aggregator struct {
 	now     func() time.Time
 	maxKeys int
 	series  map[Key]*series
-	since   time.Time // first record ever counted, the start of RangeTotal
-	dirty   bool
-	path    string
+	// accounts holds the claude cost per credential, the share of each account's own quota window.
+	accounts map[accountKey]*series
+	since    time.Time // first record ever counted, the start of RangeTotal
+	dirty    bool
+	path     string
 
 	flushMu sync.Mutex
 	loopMu  sync.Mutex
@@ -180,7 +189,7 @@ func New(now func() time.Time, maxKeys int) *Aggregator {
 	if maxKeys <= 0 {
 		maxKeys = DefaultMaxKeys
 	}
-	return &Aggregator{now: now, maxKeys: maxKeys, series: make(map[Key]*series)}
+	return &Aggregator{now: now, maxKeys: maxKeys, series: make(map[Key]*series), accounts: make(map[accountKey]*series)}
 }
 
 var defaultAggregator = New(time.Now, DefaultMaxKeys)
@@ -197,11 +206,15 @@ func (a *Aggregator) HandleUsage(ctx context.Context, record coreusage.Record) {
 		return
 	}
 	key, counters := fromRecord(ctx, record, a.now())
-	a.Add(key, counters)
+	a.add(key, counters, strings.TrimSpace(record.AuthIndex))
 }
 
 // Add records counters for key in the bucket of the current clock time.
 func (a *Aggregator) Add(key Key, counters Counters) {
+	a.add(key, counters, "")
+}
+
+func (a *Aggregator) add(key Key, counters Counters, authIndex string) {
 	if a == nil {
 		return
 	}
@@ -212,6 +225,7 @@ func (a *Aggregator) Add(key Key, counters Counters) {
 	s := a.seriesLocked(key)
 	s.add(currentID, counters, currentID)
 	s.total.add(counters)
+	a.addAccountCostLocked(key, counters, authIndex, currentID)
 	if a.since.IsZero() {
 		a.since = now
 	}
@@ -259,7 +273,10 @@ func (a *Aggregator) makeRoomLocked() {
 }
 
 // Snapshot sums each key over r; zero-request rows are omitted, order is total_tokens desc.
-func (a *Aggregator) Snapshot(r Range) Snapshot {
+func (a *Aggregator) Snapshot(r Range) Snapshot { return a.SnapshotWithQuota(r, nil) }
+
+// SnapshotWithQuota is Snapshot plus the quota block and row quota shares priced against pool; nil pool: none.
+func (a *Aggregator) SnapshotWithQuota(r Range, pool *claudequota.Pool) Snapshot {
 	if r == "" {
 		r = RangeWindow
 	}
@@ -311,6 +328,7 @@ func (a *Aggregator) Snapshot(r Range) Snapshot {
 		}
 		out.Models = append(out.Models, row)
 	}
+	out.Quota = a.quotaLocked(pool, currentID, out.Models)
 	sort.Slice(out.Models, func(i, j int) bool {
 		x, y := out.Models[i], out.Models[j]
 		if x.TotalTokens != y.TotalTokens {

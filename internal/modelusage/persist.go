@@ -30,6 +30,15 @@ type fileState struct {
 	Version int          `json:"version"`
 	Since   time.Time    `json:"since"`
 	Series  []fileSeries `json:"series"`
+	// Accounts is the claude cost per credential; v1 files have none.
+	Accounts []fileAccount `json:"accounts,omitempty"`
+}
+
+type fileAccount struct {
+	AuthIndex string   `json:"auth_index"`
+	Fable     bool     `json:"fable,omitempty"`
+	LastID    int64    `json:"last_id"`
+	Buckets   []bucket `json:"buckets"`
 }
 
 type fileSeries struct {
@@ -94,6 +103,13 @@ func (a *Aggregator) Open(path string) {
 		s.total.add(fsr.Total)
 		s.lastID = max(s.lastID, min(fsr.LastID, currentID))
 	}
+	for _, fa := range state.Accounts {
+		s := a.accountSeriesLocked(accountKey{AuthIndex: fa.AuthIndex, Fable: fa.Fable})
+		for _, b := range fa.Buckets {
+			s.add(min(b.ID, currentID), b.Counters, currentID)
+		}
+		s.lastID = max(s.lastID, min(fa.LastID, currentID))
+	}
 	if !state.Since.IsZero() && (a.since.IsZero() || state.Since.Before(a.since)) {
 		a.since = state.Since
 	}
@@ -117,6 +133,14 @@ func (a *Aggregator) Flush() error {
 			Provider: key.Provider, Model: key.Model, Subagent: key.Subagent,
 			LastID: s.lastID, Total: s.total, Buckets: s.buckets,
 		})
+	}
+	for key, s := range a.accounts {
+		s.prune(currentID)
+		if len(s.buckets) == 0 {
+			delete(a.accounts, key)
+			continue
+		}
+		state.Accounts = append(state.Accounts, fileAccount{AuthIndex: key.AuthIndex, Fable: key.Fable, LastID: s.lastID, Buckets: s.buckets})
 	}
 	data, errMarshal := json.Marshal(state)
 	path := a.path
