@@ -25,15 +25,18 @@ func TestModelUsagePricesClaudeRowsAgainstPooledQuota(t *testing.T) {
 		q.server.engine.ServeHTTP(rec, req)
 		return rec
 	}
-	// The window began before tracking: the first read sets the 40% baseline, the rate needs a 5-point change.
-	getModels()
 	// Model unique to this test: the default aggregator is process-wide.
 	const model = "claude-sonnet-5-5-20990101"
-	modelusage.Default().HandleUsage(context.Background(), coreusage.Record{
-		Provider: "claude", Model: model, AuthIndex: index,
-		Detail: coreusage.Detail{InputTokens: 1000, OutputTokens: 100, TotalTokens: 1100},
-	})
-	q.respond("healthy", "claude-sonnet-5-5", unifiedHeaders(q.clock.Now(), "0.10", "0.46", "0.20", "allowed"))
+	// The window began before tracking: the first recorded reading (40%) is the baseline, so the rate needs a
+	// 5-point change. Each request carries its response's rate-limit headers, as the executor records them.
+	for _, used := range []string{"0.40", "0.46"} {
+		headers := unifiedHeaders(q.clock.Now(), "0.10", used, "0.20", "allowed")
+		modelusage.Default().HandleUsage(context.Background(), coreusage.Record{
+			Provider: "claude", Model: model, AuthIndex: index, ResponseHeaders: headers,
+			Detail: coreusage.Detail{InputTokens: 1000, OutputTokens: 100, TotalTokens: 1100},
+		})
+		q.respond("healthy", "claude-sonnet-5-5", headers)
+	}
 	rec := getModels()
 	var body struct {
 		Models []struct {
@@ -65,8 +68,8 @@ func TestModelUsagePricesClaudeRowsAgainstPooledQuota(t *testing.T) {
 	}
 	for _, row := range body.Models {
 		rowFound = rowFound || row.Model == model
-		if row.Model == model && (row.CostUSDMicros != 3000 || row.QuotaWeeklyPct == nil) {
-			t.Fatalf("row %+v: want 3000 µUSD with quota_weekly_pct", row)
+		if row.Model == model && (row.CostUSDMicros != 6000 || row.QuotaWeeklyPct == nil) {
+			t.Fatalf("row %+v: want 6000 µUSD with quota_weekly_pct", row)
 		}
 	}
 	if !found || !rowFound {

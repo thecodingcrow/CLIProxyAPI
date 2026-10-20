@@ -126,26 +126,49 @@ func (acc *account) costAt(at time.Time, currentID int64) int64 {
 	return acc.total.CostUSDMicros - acc.sumSince(at, currentID).CostUSDMicros
 }
 
-// baselineLocked returns win's baseline, starting one for a new window. A window tracking covered from
-// its start is exact: (0%, cost at the start). Otherwise the first reading seen pairs with the cost then.
-func (a *Aggregator) baselineLocked(acc *account, win claudequota.AccountWindow, currentID int64) *baseline {
-	// Reset timestamps may jitter between responses; a new window moves them by days.
-	if b := acc.base; b != nil && b.ResetsAt.Sub(win.ResetsAt).Abs() <= time.Hour {
-		return b
+// sameWindow tolerates reset timestamps jittering between responses; a new window moves them by days.
+func (b *baseline) sameWindow(resetsAt time.Time) bool {
+	return b != nil && b.ResetsAt.Sub(resetsAt).Abs() <= time.Hour
+}
+
+// observeQuotaLocked keeps the first reading of each window that tracking did not cover from its start,
+// paired with the cumulative cost including the request that carried it. Covered windows need no reading.
+func (a *Aggregator) observeQuotaLocked(authIndex string, reading *claudequota.Usage, currentID int64) {
+	if reading == nil {
+		return
 	}
-	start := win.ResetsAt.Add(-quotaWindow)
-	b := &baseline{WindowStart: start, ResetsAt: win.ResetsAt, Exact: !a.costSince.After(start)}
-	if b.Exact {
-		b.At, b.CostUSDMicros = start, acc.costAt(start, currentID)
-	} else {
-		b.At, b.UsedPct, b.CostUSDMicros = win.ObservedAt, win.UsedPct, acc.total.CostUSDMicros
-		if b.At.IsZero() {
-			b.At = a.now()
+	observe := func(key accountKey, limit *claudequota.Limit) {
+		if limit == nil || limit.ResetsAt == nil {
+			return
+		}
+		acc := a.accountLocked(key)
+		if acc.base.sameWindow(*limit.ResetsAt) {
+			return
+		}
+		start := limit.ResetsAt.Add(-quotaWindow)
+		acc.base = nil
+		if a.costSince.After(start) {
+			acc.base = &baseline{WindowStart: start, ResetsAt: *limit.ResetsAt, UsedPct: limit.Percent,
+				CostUSDMicros: acc.total.CostUSDMicros, At: limit.ObservedAt}
 		}
 	}
-	acc.base = b
-	a.dirty = true
-	return b
+	observe(accountKey{AuthIndex: authIndex}, reading.WeeklyAll)
+	if fable, ok := reading.Scoped[claudequota.ScopeFable]; ok {
+		observe(accountKey{AuthIndex: authIndex, Fable: true}, &fable)
+	}
+}
+
+// baselineFor is win's baseline without changing state: exact (0%, cost at the window start) when tracking
+// covered the start, else the recorded first reading; false when there is neither.
+func (a *Aggregator) baselineFor(acc *account, win claudequota.AccountWindow, currentID int64) (baseline, bool) {
+	start := win.ResetsAt.Add(-quotaWindow)
+	if !a.costSince.After(start) {
+		return baseline{WindowStart: start, ResetsAt: win.ResetsAt, CostUSDMicros: acc.costAt(start, currentID), At: start, Exact: true}, true
+	}
+	if acc.base.sameWindow(win.ResetsAt) {
+		return *acc.base, true
+	}
+	return baseline{}, false
 }
 
 // quotaLocked builds the quota block and sets each row's quota share; nil without pool data.
@@ -186,8 +209,14 @@ func (a *Aggregator) windowLocked(pooled claudequota.Pooled, fable bool, current
 	w := &QuotaWindow{UsedPct: pooled.UsedPct, Accounts: []QuotaAccount{}}
 	var used float64
 	for _, win := range pooled.Windows {
-		acc := a.accountLocked(accountKey{AuthIndex: win.AuthIndex, Fable: fable})
-		b := a.baselineLocked(acc, win, currentID)
+		acc, ok := a.accounts[accountKey{AuthIndex: win.AuthIndex, Fable: fable}]
+		if !ok {
+			continue
+		}
+		b, ok := a.baselineFor(acc, win, currentID)
+		if !ok {
+			continue
+		}
 		deltaUsed, deltaCost := win.UsedPct-b.UsedPct, acc.total.CostUSDMicros-b.CostUSDMicros
 		if deltaCost <= 0 || (!b.Exact && deltaUsed < minDeltaPct) {
 			continue

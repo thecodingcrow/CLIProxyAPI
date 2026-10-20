@@ -2,8 +2,10 @@ package modelusage
 
 import (
 	"context"
+	"net/http"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strconv"
 	"testing"
 	"time"
@@ -21,18 +23,29 @@ func opus(agg *Aggregator, input int64) { // input x $4/MTok
 	agg.HandleUsage(context.Background(), claudeRecord("claude-opus-5-5", "ia", input, 0, 0, 0))
 }
 
+// opusRead is opus whose response carries ia's weekly reading, as the claude executor records it.
+func opusRead(agg *Aggregator, input int64, used float64, resets time.Time) {
+	record := claudeRecord("claude-opus-5-5", "ia", input, 0, 0, 0)
+	record.ResponseHeaders = http.Header{
+		"Anthropic-Ratelimit-Unified-7d-Status":      {"allowed"},
+		"Anthropic-Ratelimit-Unified-7d-Utilization": {strconv.FormatFloat(used/100, 'f', -1, 64)},
+		"Anthropic-Ratelimit-Unified-7d-Reset":       {strconv.FormatInt(resets.Unix(), 10)},
+	}
+	agg.HandleUsage(context.Background(), record)
+}
+
 // Tracking starts mid-window: utilization before it has no cost, so the rate counts only the change since the first reading.
 func TestMidWindowTrackingRatesOnlyTheChangeSinceFirstReading(t *testing.T) {
 	clock := newClock()
 	agg := New(clock.Now, 0)
 	resets := clock.Now().Add(6 * day) // window started a day before tracking
-	opus(agg, 100_000)                 // 400,000 µUSD before the first reading
 	first := clock.Now()
+	opusRead(agg, 100_000, 28, resets) // the baseline: its reading pairs with the cost including it, 400,000 µUSD
 	if q := agg.SnapshotWithQuota(Range7d, onePool(28, resets, first)).Quota; q.WeeklyAll != nil || q.Accounts != 2 {
 		t.Fatalf("first reading: %+v, want no rate yet and 2 pooled accounts", q)
 	}
 	clock.Advance(time.Hour)
-	opus(agg, 250_000) // 1,000,000 µUSD
+	opusRead(agg, 250_000, 29, resets) // 1,000,000 µUSD; a later reading leaves the baseline
 	if q := agg.SnapshotWithQuota(Range7d, onePool(29, resets, clock.Now())).Quota; q.WeeklyAll != nil {
 		t.Fatalf("1-point change: %+v, want omitted as noise", q.WeeklyAll)
 	}
@@ -68,11 +81,10 @@ func TestWindowRolloverRestartsTheBaselineAtTheNewWindowStart(t *testing.T) {
 	clock := newClock()
 	agg := New(clock.Now, 0)
 	resets := clock.Now().Add(day) // started before tracking
-	agg.SnapshotWithQuota(Range7d, onePool(90, resets, clock.Now()))
-	opus(agg, 100_000)
+	opusRead(agg, 100_000, 90, resets)
 	clock.Advance(2 * day) // past the reset
-	opus(agg, 250_000)
 	next := resets.Add(7 * day)
+	opusRead(agg, 250_000, 2, next)
 	w := agg.SnapshotWithQuota(Range7d, onePool(2, next, clock.Now())).Quota.WeeklyAll
 	if w == nil || w.CostUSDMicros != 1_000_000 || !w.Accounts[0].Exact || !near(w.PctPerUSD, 2.0/2/1.0) {
 		t.Fatalf("after rollover: %+v, want exact from the new window start", w)
@@ -85,8 +97,7 @@ func TestBaselinesAndTrackingStartSurviveRestart(t *testing.T) {
 	agg := New(clock.Now, 0)
 	agg.Open(path)
 	resets := clock.Now().Add(6 * day) // started before tracking
-	opus(agg, 100_000)
-	agg.SnapshotWithQuota(Range7d, onePool(28, resets, clock.Now()))
+	opusRead(agg, 100_000, 28, resets) // baseline from the record alone, no read before the flush
 	opus(agg, 250_000)
 	if err := agg.Flush(); err != nil {
 		t.Fatal(err)
@@ -121,14 +132,56 @@ func TestPricedFileWithoutTrackingStartTracksFromOldestBucket(t *testing.T) {
 	agg := New(clock.Now, 0)
 	agg.Open(path)
 	before := clock.Now().Add(5 * day) // window started a day before the oldest bucket
-	agg.SnapshotWithQuota(Range7d, onePool(28, before, clock.Now()))
+	opusRead(agg, 100_000, 28, before)
 	opus(agg, 250_000)
 	w := agg.SnapshotWithQuota(Range7d, onePool(34, before, clock.Now())).Quota.WeeklyAll
 	if w == nil || w.Accounts[0].Exact || w.CostUSDMicros != 1_000_000 {
 		t.Fatalf("window before tracking: %+v, want inexact, $1 since the first reading", w)
 	}
 	after := clock.Now().Add(-12*time.Hour + 7*day) // started after the oldest bucket
-	if w := agg.SnapshotWithQuota(Range7d, onePool(1, after, clock.Now())).Quota.WeeklyAll; w == nil || !w.Accounts[0].Exact || w.CostUSDMicros != 1_000_000 {
+	if w := agg.SnapshotWithQuota(Range7d, onePool(1, after, clock.Now())).Quota.WeeklyAll; w == nil || !w.Accounts[0].Exact || w.CostUSDMicros != 1_400_000 {
 		t.Fatalf("window after tracking start: %+v, want exact", w)
+	}
+}
+
+// accountState deep-copies the per-account state a read could touch.
+func accountState(agg *Aggregator) (map[accountKey]account, bool) {
+	agg.mu.Lock()
+	defer agg.mu.Unlock()
+	out := make(map[accountKey]account, len(agg.accounts))
+	for k, acc := range agg.accounts {
+		c := account{series: series{buckets: append([]bucket(nil), acc.buckets...), total: acc.total, lastID: acc.lastID}}
+		if acc.base != nil {
+			b := *acc.base
+			c.base = &b
+		}
+		out[k] = c
+	}
+	return out, agg.dirty
+}
+
+func TestReadNeverMutatesState(t *testing.T) {
+	clock := newClock()
+	agg := New(clock.Now, 0)
+	agg.Open(filepath.Join(t.TempDir(), FileName))
+	resets := clock.Now().Add(6 * day)
+	opusRead(agg, 100_000, 28, resets)
+	opus(agg, 250_000)
+	if err := agg.Flush(); err != nil {
+		t.Fatal(err)
+	}
+	before, dirty := accountState(agg)
+	pool := onePool(40, resets, clock.Now())
+	// A window with no baseline, one with an unknown account, and a rolled-over window.
+	pool.WeeklyAll.Windows = append(pool.WeeklyAll.Windows,
+		claudequota.AccountWindow{AuthIndex: "unseen", UsedPct: 50, ResetsAt: resets, ObservedAt: clock.Now()})
+	pool.Fable = claudequota.Pooled{UsedPct: 10, Pooled: 1, Windows: []claudequota.AccountWindow{{AuthIndex: "ia", UsedPct: 10, ResetsAt: resets.Add(-3 * day)}}}
+	for _, r := range allRanges {
+		agg.SnapshotWithQuota(r, pool)
+		agg.SnapshotWithQuota(r, onePool(30, resets.Add(7*day), clock.Now()))
+	}
+	after, dirtyAfter := accountState(agg)
+	if !reflect.DeepEqual(before, after) || dirty || dirtyAfter {
+		t.Fatalf("read changed state:\nbefore %+v (dirty %v)\nafter  %+v (dirty %v)", before, dirty, after, dirtyAfter)
 	}
 }
