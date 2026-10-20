@@ -5,6 +5,7 @@ package claudequota
 
 import (
 	"math"
+	"net/http"
 	"sort"
 	"strconv"
 	"strings"
@@ -107,6 +108,17 @@ func UsageFrom(observations []Observation) *Usage {
 		return nil
 	}
 	return usage
+}
+
+// UsageFromHeaders reads the unified windows of one response, keyed as stored signals are; nil when it carries none.
+func UsageFromHeaders(headers http.Header, observedAt time.Time) *Usage {
+	signals := map[string]string{}
+	for key, values := range headers {
+		if key = http.CanonicalHeaderKey(strings.TrimSpace(key)); strings.HasPrefix(key, unifiedHeaderPrefix) && len(values) > 0 {
+			signals[key] = strings.TrimSpace(values[len(values)-1])
+		}
+	}
+	return UsageFrom([]Observation{{Signals: signals, ObservedAt: observedAt}})
 }
 
 // parseWindow reads one window; nil unless it reports a utilization or a rejection.
