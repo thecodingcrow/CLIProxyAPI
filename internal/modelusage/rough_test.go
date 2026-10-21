@@ -87,14 +87,14 @@ func TestMeasuredRateSaysSo(t *testing.T) {
 
 func TestRoughFableRateCountsOnlyFableRows(t *testing.T) {
 	agg, pool := roughFixture(t)
-	agg.HandleUsage(context.Background(), claudeRecord("claude-fable-5-1", "ia", 1_000_000, 0, 0, 0)) // $10
+	agg.HandleUsage(context.Background(), claudeRecord("claude-fable-5-1", "ia", 2_000_000, 0, 0, 0)) // $20
 	pool.Fable = claudequota.Pooled{UsedPct: 20, Pooled: 1, Windows: []claudequota.AccountWindow{{AuthIndex: "ia", UsedPct: 20, ResetsAt: pool.WeeklyAll.Windows[1].ResetsAt}}}
 	snap := agg.SnapshotWithQuota(Range7d, pool)
 	f := snap.Quota.Fable
-	if f == nil || f.Method != MethodRough || f.CostUSDMicros != 10_000_000 || !near(f.PctPerUSD, 2) || len(f.Models) != 1 {
-		t.Fatalf("fable %+v, want rough 20%% over $10 of Fable rows", f)
+	if f == nil || f.Method != MethodRough || f.CostUSDMicros != 20_000_000 || !near(f.PctPerUSD, 1) || len(f.Models) != 1 {
+		t.Fatalf("fable %+v, want rough 20%% over $20 of Fable rows", f)
 	}
-	if w := snap.Quota.WeeklyAll; w.CostUSDMicros != 1_209_000_000 {
+	if w := snap.Quota.WeeklyAll; w.CostUSDMicros != 1_219_000_000 {
 		t.Fatalf("weekly_all cost %d, want every claude row", w.CostUSDMicros)
 	}
 }

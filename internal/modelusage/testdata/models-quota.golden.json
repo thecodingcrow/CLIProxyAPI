@@ -12,15 +12,31 @@
       "subagent": false,
       "requests": 2,
       "failed": 0,
-      "input_tokens": 3000,
+      "input_tokens": 30000000,
       "output_tokens": 0,
       "cached_tokens": 0,
       "reasoning_tokens": 0,
-      "total_tokens": 3000,
+      "total_tokens": 30000000,
       "cache_write_tokens": 0,
-      "cost_usd_micros": 12000,
+      "cost_usd_micros": 120000000,
       "unpriced_requests": 0,
-      "quota_weekly_pct": 37.910447761194035
+      "quota_weekly_pct": 31.748677138452564
+    },
+    {
+      "provider": "claude",
+      "model": "claude-sonnet-5-5",
+      "subagent": false,
+      "requests": 1,
+      "failed": 0,
+      "input_tokens": 30000000,
+      "output_tokens": 0,
+      "cached_tokens": 0,
+      "reasoning_tokens": 0,
+      "total_tokens": 30000000,
+      "cache_write_tokens": 0,
+      "cost_usd_micros": 60000000,
+      "unpriced_requests": 0,
+      "quota_weekly_pct": 15.874338569226282
     },
     {
       "provider": "claude",
@@ -28,15 +44,15 @@
       "subagent": false,
       "requests": 1,
       "failed": 0,
-      "input_tokens": 1000,
+      "input_tokens": 10000000,
       "output_tokens": 0,
       "cached_tokens": 0,
       "reasoning_tokens": 0,
-      "total_tokens": 1000,
+      "total_tokens": 10000000,
       "cache_write_tokens": 0,
-      "cost_usd_micros": 10000,
+      "cost_usd_micros": 100000000,
       "unpriced_requests": 0,
-      "quota_weekly_pct": 31.59203980099503,
+      "quota_weekly_pct": 26.45723094871047,
       "quota_fable_pct": 10
     },
     {
@@ -45,31 +61,15 @@
       "subagent": false,
       "requests": 1,
       "failed": 0,
-      "input_tokens": 1000,
+      "input_tokens": 100000,
       "output_tokens": 0,
       "cached_tokens": 0,
       "reasoning_tokens": 0,
-      "total_tokens": 1000,
+      "total_tokens": 100000,
       "cache_write_tokens": 0,
-      "cost_usd_micros": 100,
+      "cost_usd_micros": 10000,
       "unpriced_requests": 0,
-      "quota_weekly_pct": 0.31592039800995025
-    },
-    {
-      "provider": "claude",
-      "model": "claude-sonnet-5-5",
-      "subagent": false,
-      "requests": 1,
-      "failed": 0,
-      "input_tokens": 1000,
-      "output_tokens": 0,
-      "cached_tokens": 0,
-      "reasoning_tokens": 0,
-      "total_tokens": 1000,
-      "cache_write_tokens": 0,
-      "cost_usd_micros": 2000,
-      "unpriced_requests": 0,
-      "quota_weekly_pct": 6.318407960199005
+      "quota_weekly_pct": 0.002645723094871047
     },
     {
       "provider": "codex",
@@ -94,8 +94,8 @@
     "weekly_all": {
       "method": "measured",
       "used_pct": 63.5,
-      "cost_usd_micros": 20100,
-      "pct_per_usd": 3159.2039800995026,
+      "cost_usd_micros": 240010000,
+      "pct_per_usd": 0.2645723094871047,
       "accounts_in_rate": 2,
       "accounts": [
         {
@@ -103,7 +103,7 @@
           "used_pct": 27,
           "window_start": "2025-02-24T21:20:00Z",
           "resets_at": "2025-03-03T21:20:00Z",
-          "cost_usd_micros": 18000,
+          "cost_usd_micros": 180000000,
           "baseline_at": "2025-02-24T21:20:00Z",
           "baseline_used_pct": 0,
           "exact": true
@@ -113,7 +113,7 @@
           "used_pct": 100,
           "window_start": "2025-02-19T21:20:00Z",
           "resets_at": "2025-02-26T21:20:00Z",
-          "cost_usd_micros": 2100,
+          "cost_usd_micros": 60010000,
           "baseline_at": "2025-02-19T21:20:00Z",
           "baseline_used_pct": 0,
           "exact": true
@@ -123,8 +123,8 @@
     "fable": {
       "method": "measured",
       "used_pct": 10,
-      "cost_usd_micros": 10000,
-      "pct_per_usd": 1000,
+      "cost_usd_micros": 100000000,
+      "pct_per_usd": 0.1,
       "accounts_in_rate": 1,
       "accounts": [
         {
@@ -132,7 +132,7 @@
           "used_pct": 10,
           "window_start": "2025-02-21T21:20:00Z",
           "resets_at": "2025-02-28T21:20:00Z",
-          "cost_usd_micros": 10000,
+          "cost_usd_micros": 100000000,
           "baseline_at": "2025-02-21T21:20:00Z",
           "baseline_used_pct": 0,
           "exact": true

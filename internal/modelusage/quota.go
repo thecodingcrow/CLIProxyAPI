@@ -77,6 +77,10 @@ func inFableScope(model string) bool {
 // minDeltaPct is the smallest utilization change any rate uses: readings move in ~1-point steps, over cents right after a rollover.
 const minDeltaPct = 5
 
+// maxPctPerUsd is the inverse of the smallest plausible weekly subscription quota in API-equivalent dollars, $50;
+// live implied quotas are ~$1,860 (rough) and ~$5,000 (measured). A faster rate is a denominator of cents.
+const maxPctPerUsd = 2.0
+
 // account is one credential's cost: 7 days of buckets, the cumulative total since costSince, and the
 // baseline its quota window is rated from.
 type account struct {
@@ -232,7 +236,7 @@ func (a *Aggregator) windowLocked(pooled claudequota.Pooled, fable bool, current
 		}
 		b, ok := a.baselineFor(acc, win, currentID)
 		deltaUsed, deltaCost := win.UsedPct-b.UsedPct, acc.total.CostUSDMicros-b.CostUSDMicros
-		if !ok || deltaCost <= 0 || deltaUsed < minDeltaPct {
+		if !ok || deltaCost <= 0 || deltaUsed < minDeltaPct || deltaUsed/(float64(deltaCost)/1e6) > maxPctPerUsd {
 			// Rows carry this account's spend too; rating it at the others' rate would inflate every row.
 			if acc.sumSince(maxTime(win.ResetsAt.Add(-quotaWindow), a.costSince), currentID).CostUSDMicros > 0 {
 				return nil
@@ -251,6 +255,9 @@ func (a *Aggregator) windowLocked(pooled claudequota.Pooled, fable bool, current
 	}
 	w.AccountsInRate = len(w.Accounts)
 	w.PctPerUSD = used / float64(pooled.Pooled) / (float64(w.CostUSDMicros) / 1e6)
+	if w.PctPerUSD > maxPctPerUsd {
+		return nil
+	}
 	return w
 }
 
@@ -317,6 +324,9 @@ func (a *Aggregator) roughLocked(pooled claudequota.Pooled, fable bool, currentI
 	}
 	w.WindowStart = ptrTime(utcSecond(start))
 	w.PctPerUSD = w.UsedPct / (float64(w.CostUSDMicros) / 1e6)
+	if w.PctPerUSD > maxPctPerUsd {
+		return nil
+	}
 	return w
 }
 
