@@ -92,6 +92,7 @@
     "accounts": 2,
     "pooling": "mean",
     "weekly_all": {
+      "method": "measured",
       "used_pct": 63.5,
       "cost_usd_micros": 20100,
       "pct_per_usd": 3159.2039800995026,
@@ -120,6 +121,7 @@
       ]
     },
     "fable": {
+      "method": "measured",
       "used_pct": 10,
       "cost_usd_micros": 10000,
       "pct_per_usd": 1000,

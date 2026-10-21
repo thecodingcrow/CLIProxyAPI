@@ -24,13 +24,24 @@ type Quota struct {
 	Stale      bool         `json:"stale"`
 }
 
-// QuotaWindow is one weekly window across accounts, each since its own baseline.
+// Rate methods: measured pairs each account's utilization change with its own cost; rough spreads the pooled
+// percent over all claude cost since the earliest running window start, before a measured rate qualifies.
+const (
+	MethodMeasured = "measured"
+	MethodRough    = "rough"
+)
+
+// QuotaWindow is one weekly window across accounts, rated by Method.
 type QuotaWindow struct {
+	Method string `json:"method"`
+	// WindowStart is where a rough rate's cost begins; measured rates start per account.
+	WindowStart *time.Time `json:"window_start,omitempty"`
 	// UsedPct is the pooled mean.
 	UsedPct float64 `json:"used_pct"`
-	// CostUSDMicros sums the listed accounts' cost since their baselines.
+	// CostUSDMicros is the measured accounts' cost since their baselines, or rough: all claude cost since WindowStart.
 	CostUSDMicros int64 `json:"cost_usd_micros"`
-	// PctPerUSD is the listed accounts' utilization change summed, over all pooled accounts, per USD of their cost.
+	// PctPerUSD is measured: the listed accounts' utilization change summed, over all pooled accounts, per USD of
+	// their cost; rough: UsedPct per USD of CostUSDMicros.
 	PctPerUSD float64 `json:"pct_per_usd"`
 	// AccountsInRate counts the listed accounts.
 	AccountsInRate int            `json:"accounts_in_rate"`
@@ -39,16 +50,16 @@ type QuotaWindow struct {
 	Models []string `json:"models,omitempty"`
 }
 
-// QuotaAccount is one account whose utilization change since its baseline pairs with proxy cost.
+// QuotaAccount is one account in the rate; the cost and baseline fields are measured only.
 type QuotaAccount struct {
 	AuthIndex   string    `json:"auth_index"`
 	UsedPct     float64   `json:"used_pct"`
 	WindowStart time.Time `json:"window_start"`
 	ResetsAt    time.Time `json:"resets_at"`
 	// CostUSDMicros is the cost since BaselineAt.
-	CostUSDMicros   int64     `json:"cost_usd_micros"`
-	BaselineAt      time.Time `json:"baseline_at"`
-	BaselineUsedPct float64   `json:"baseline_used_pct"`
+	CostUSDMicros   *int64     `json:"cost_usd_micros,omitempty"`
+	BaselineAt      *time.Time `json:"baseline_at,omitempty"`
+	BaselineUsedPct *float64   `json:"baseline_used_pct,omitempty"`
 	// Exact: the baseline is the window start, so the whole window's utilization pairs with its cost.
 	Exact bool `json:"exact"`
 }
@@ -178,7 +189,13 @@ func (a *Aggregator) quotaLocked(pool *claudequota.Pool, currentID int64, rows [
 	}
 	q := &Quota{Provider: quotaProvider, Accounts: pool.Accounts, Pooling: claudequota.AveragingMean, ObservedAt: utcSecond(pool.ObservedAt), Stale: pool.Stale}
 	q.WeeklyAll = a.windowLocked(pool.WeeklyAll, false, currentID)
+	if q.WeeklyAll == nil {
+		q.WeeklyAll = a.roughLocked(pool.WeeklyAll, false, currentID)
+	}
 	q.Fable = a.windowLocked(pool.Fable, true, currentID)
+	if q.Fable == nil {
+		q.Fable = a.roughLocked(pool.Fable, true, currentID)
+	}
 	if q.Fable != nil {
 		q.Fable.Models = a.fableModelsLocked()
 	}
@@ -206,7 +223,7 @@ func (a *Aggregator) windowLocked(pooled claudequota.Pooled, fable bool, current
 	if pooled.Pooled == 0 {
 		return nil
 	}
-	w := &QuotaWindow{UsedPct: pooled.UsedPct, Accounts: []QuotaAccount{}}
+	w := &QuotaWindow{Method: MethodMeasured, UsedPct: pooled.UsedPct, Accounts: []QuotaAccount{}}
 	var used float64
 	for _, win := range pooled.Windows {
 		acc, ok := a.accounts[accountKey{AuthIndex: win.AuthIndex, Fable: fable}]
@@ -226,7 +243,7 @@ func (a *Aggregator) windowLocked(pooled claudequota.Pooled, fable bool, current
 		w.CostUSDMicros += deltaCost
 		w.Accounts = append(w.Accounts, QuotaAccount{
 			AuthIndex: win.AuthIndex, UsedPct: win.UsedPct, WindowStart: utcSecond(b.WindowStart), ResetsAt: utcSecond(win.ResetsAt),
-			CostUSDMicros: deltaCost, BaselineAt: utcSecond(b.At), BaselineUsedPct: b.UsedPct, Exact: b.Exact,
+			CostUSDMicros: &deltaCost, BaselineAt: ptrTime(utcSecond(b.At)), BaselineUsedPct: &b.UsedPct, Exact: b.Exact,
 		})
 	}
 	if w.CostUSDMicros == 0 {
@@ -272,3 +289,35 @@ func (a *Aggregator) fableModelsLocked() []string {
 	sort.Strings(models)
 	return models
 }
+
+// roughLocked spreads the pooled percent over all claude cost (every account, backfilled history too) since the
+// earliest running window start; nil without a running window, utilization or cost.
+func (a *Aggregator) roughLocked(pooled claudequota.Pooled, fable bool, currentID int64) *QuotaWindow {
+	if len(pooled.Windows) == 0 || pooled.UsedPct <= 0 {
+		return nil
+	}
+	w := &QuotaWindow{Method: MethodRough, UsedPct: pooled.UsedPct, AccountsInRate: len(pooled.Windows), Accounts: []QuotaAccount{}}
+	var start time.Time
+	for _, win := range pooled.Windows {
+		winStart := win.ResetsAt.Add(-quotaWindow)
+		if start.IsZero() || winStart.Before(start) {
+			start = winStart
+		}
+		w.Accounts = append(w.Accounts, QuotaAccount{
+			AuthIndex: win.AuthIndex, UsedPct: win.UsedPct, WindowStart: utcSecond(winStart), ResetsAt: utcSecond(win.ResetsAt),
+		})
+	}
+	for key, s := range a.series {
+		if key.Provider == quotaProvider && (!fable || inFableScope(key.Model)) {
+			w.CostUSDMicros += s.sumSince(start, currentID).CostUSDMicros
+		}
+	}
+	if w.CostUSDMicros <= 0 {
+		return nil
+	}
+	w.WindowStart = ptrTime(utcSecond(start))
+	w.PctPerUSD = w.UsedPct / (float64(w.CostUSDMicros) / 1e6)
+	return w
+}
+
+func ptrTime(t time.Time) *time.Time { return &t }

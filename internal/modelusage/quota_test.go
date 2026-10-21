@@ -4,6 +4,7 @@ import (
 	"context"
 	"math"
 	"path/filepath"
+	"reflect"
 	"testing"
 	"time"
 
@@ -88,10 +89,10 @@ func TestPreviousWeekSpendStaysOutOfTheAccountsWindow(t *testing.T) {
 	q := agg.SnapshotWithQuota(Range7d, &pool).Quota
 	end := clock.Now()
 	want := []QuotaAccount{
-		{AuthIndex: "ia", UsedPct: 27, WindowStart: end.Add(-day), ResetsAt: end.Add(6 * day), CostUSDMicros: 18_000, BaselineAt: end.Add(-day), Exact: true},
-		{AuthIndex: "ib", UsedPct: 100, WindowStart: end.Add(-6 * day), ResetsAt: end.Add(day), CostUSDMicros: 2100, BaselineAt: end.Add(-6 * day), Exact: true},
+		{AuthIndex: "ia", UsedPct: 27, WindowStart: end.Add(-day), ResetsAt: end.Add(6 * day), CostUSDMicros: ptr[int64](18_000), BaselineAt: ptr(end.Add(-day)), BaselineUsedPct: ptr(0.0), Exact: true},
+		{AuthIndex: "ib", UsedPct: 100, WindowStart: end.Add(-6 * day), ResetsAt: end.Add(day), CostUSDMicros: ptr[int64](2100), BaselineAt: ptr(end.Add(-6 * day)), BaselineUsedPct: ptr(0.0), Exact: true},
 	}
-	if q.WeeklyAll.CostUSDMicros != 20_100 || len(q.WeeklyAll.Accounts) != 2 || q.WeeklyAll.Accounts[0] != want[0] || q.WeeklyAll.Accounts[1] != want[1] {
+	if q.WeeklyAll.CostUSDMicros != 20_100 || !reflect.DeepEqual(q.WeeklyAll.Accounts, want) {
 		t.Fatalf("weekly_all %+v, want accounts %+v", q.WeeklyAll, want)
 	}
 }
@@ -117,8 +118,9 @@ func TestQuotaOmission(t *testing.T) {
 		"no account data": {pool: &claudequota.Pool{}},
 		"no running window": {pool: &claudequota.Pool{Accounts: 2, ObservedAt: pool.ObservedAt,
 			WeeklyAll: claudequota.Pooled{UsedPct: 10, Pooled: 2}}, block: true},
-		"no cost in any window": {pool: &claudequota.Pool{Accounts: 1, ObservedAt: pool.ObservedAt,
-			WeeklyAll: claudequota.Pooled{UsedPct: 10, Pooled: 1, Windows: []claudequota.AccountWindow{{AuthIndex: "other", UsedPct: 10, ResetsAt: pool.WeeklyAll.Windows[0].ResetsAt}}}}, block: true},
+		// No account has cost in its window, yet claude rows do: the rough rate.
+		"no account cost": {pool: &claudequota.Pool{Accounts: 1, ObservedAt: pool.ObservedAt,
+			WeeklyAll: claudequota.Pooled{UsedPct: 10, Pooled: 1, Windows: []claudequota.AccountWindow{{AuthIndex: "other", UsedPct: 10, ResetsAt: pool.WeeklyAll.Windows[0].ResetsAt}}}}, block: true, weekly: true},
 		"no Fable scope": {pool: &claudequota.Pool{Accounts: 2, ObservedAt: pool.ObservedAt, WeeklyAll: pool.WeeklyAll}, block: true, weekly: true},
 	} {
 		snap := agg.SnapshotWithQuota(Range7d, tc.pool)
@@ -152,3 +154,5 @@ func TestAccountCostSurvivesRestart(t *testing.T) {
 		t.Fatalf("after restart weekly %+v fable %+v, want weekly %+v fable %+v", got.WeeklyAll, got.Fable, want.WeeklyAll, want.Fable)
 	}
 }
+
+func ptr[T any](v T) *T { return &v }

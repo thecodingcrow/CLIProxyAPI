@@ -41,13 +41,13 @@ func TestMidWindowTrackingRatesOnlyTheChangeSinceFirstReading(t *testing.T) {
 	resets := clock.Now().Add(6 * day) // window started a day before tracking
 	first := clock.Now()
 	opusRead(agg, 100_000, 28, resets) // the baseline: its reading pairs with the cost including it, 400,000 µUSD
-	if q := agg.SnapshotWithQuota(Range7d, onePool(28, resets, first)).Quota; q.WeeklyAll != nil || q.Accounts != 2 {
-		t.Fatalf("first reading: %+v, want no rate yet and 2 pooled accounts", q)
+	if q := agg.SnapshotWithQuota(Range7d, onePool(28, resets, first)).Quota; measured(q.WeeklyAll) || q.Accounts != 2 {
+		t.Fatalf("first reading: %+v, want no measured rate yet and 2 pooled accounts", q)
 	}
 	clock.Advance(time.Hour)
 	opusRead(agg, 250_000, 29, resets) // 1,000,000 µUSD; a later reading leaves the baseline
-	if q := agg.SnapshotWithQuota(Range7d, onePool(29, resets, clock.Now())).Quota; q.WeeklyAll != nil {
-		t.Fatalf("1-point change: %+v, want omitted as noise", q.WeeklyAll)
+	if q := agg.SnapshotWithQuota(Range7d, onePool(29, resets, clock.Now())).Quota; measured(q.WeeklyAll) {
+		t.Fatalf("1-point change: %+v, want no measured rate: noise", q.WeeklyAll)
 	}
 	q := agg.SnapshotWithQuota(Range7d, onePool(34, resets, clock.Now())).Quota
 	w := q.WeeklyAll
@@ -55,7 +55,7 @@ func TestMidWindowTrackingRatesOnlyTheChangeSinceFirstReading(t *testing.T) {
 		t.Fatalf("6-point change: %+v, want 6%% over 2 pooled accounts per $1", w)
 	}
 	got := w.Accounts[0]
-	if got.Exact || got.BaselineUsedPct != 28 || !got.BaselineAt.Equal(first) || got.UsedPct != 34 || got.CostUSDMicros != 1_000_000 {
+	if got.Exact || *got.BaselineUsedPct != 28 || !got.BaselineAt.Equal(first) || got.UsedPct != 34 || *got.CostUSDMicros != 1_000_000 {
 		t.Fatalf("account %+v, want inexact baseline 28%% at the first reading", got)
 	}
 }
@@ -69,7 +69,7 @@ func TestWindowStartedAfterTrackingIsExact(t *testing.T) {
 	opus(agg, 250_000)
 	resets := clock.Now().Add(6 * day) // window started a day ago
 	w := agg.SnapshotWithQuota(Range7d, onePool(3, resets, clock.Now())).Quota.WeeklyAll
-	if w == nil || w.CostUSDMicros != 1_000_000 || !near(w.PctPerUSD, 3.0/2/1.0) || !w.Accounts[0].Exact || w.Accounts[0].BaselineUsedPct != 0 {
+	if w == nil || w.CostUSDMicros != 1_000_000 || !near(w.PctPerUSD, 3.0/2/1.0) || !w.Accounts[0].Exact || *w.Accounts[0].BaselineUsedPct != 0 {
 		t.Fatalf("exact window: %+v", w)
 	}
 	if !w.Accounts[0].BaselineAt.Equal(resets.Add(-7 * day)) {
@@ -106,7 +106,7 @@ func TestBaselinesAndTrackingStartSurviveRestart(t *testing.T) {
 	clock.Advance(2 * day)
 	after := New(clock.Now, 0)
 	after.Open(path)
-	if w := after.SnapshotWithQuota(Range7d, onePool(34, resets, clock.Now())).Quota.WeeklyAll; w == nil || w.CostUSDMicros != 1_000_000 || w.Accounts[0].BaselineUsedPct != 28 {
+	if w := after.SnapshotWithQuota(Range7d, onePool(34, resets, clock.Now())).Quota.WeeklyAll; w == nil || w.CostUSDMicros != 1_000_000 || *w.Accounts[0].BaselineUsedPct != 28 {
 		t.Fatalf("after restart: %+v, want the persisted baseline", w)
 	}
 	// A window started after tracking began but before the restart: exact only if the tracking start persisted.
@@ -204,13 +204,8 @@ func TestAccountWithCostOutsideTheRateWithholdsIt(t *testing.T) {
 			}}}
 	}
 	snap := agg.SnapshotWithQuota(RangeWindow, pool(31))
-	if snap.Quota.WeeklyAll != nil {
-		t.Fatalf("A spent outside the rate: %+v, want weekly_all omitted", snap.Quota.WeeklyAll)
-	}
-	for _, row := range snap.Models {
-		if row.QuotaWeeklyPct != nil {
-			t.Fatalf("row %s carries %v without a rate", row.Model, *row.QuotaWeeklyPct)
-		}
+	if measured(snap.Quota.WeeklyAll) {
+		t.Fatalf("A spent outside the rate: %+v, want no measured rate", snap.Quota.WeeklyAll)
 	}
 
 	snap = agg.SnapshotWithQuota(RangeWindow, pool(34))
@@ -229,3 +224,5 @@ func TestAccountWithCostOutsideTheRateWithholdsIt(t *testing.T) {
 		t.Fatalf("rows sum to %v%%, more than the pooled change %v%%", sum, pooledDelta)
 	}
 }
+
+func measured(w *QuotaWindow) bool { return w != nil && w.Method == MethodMeasured }
