@@ -18,6 +18,9 @@ func TestSnapshotJSONMatchesContract(t *testing.T) {
 	checkGolden(t, agg.SnapshotWithQuota(Range7d, &pool), "models-quota.golden.json")
 	rough, roughPool := roughFixture(t)
 	checkGolden(t, rough.SnapshotWithQuota(Range7d, roughPool), "models-quota-rough.golden.json")
+	carried, clock, resets := weekOne(t)
+	rollTo(carried, resets)
+	checkGolden(t, carried.SnapshotWithQuota(RangeTotal, soloPool(1, resets, clock.Now())), "models-quota-carried.golden.json")
 	if partial, _ := json.Marshal(Counters{CostPartial: true}); !bytes.Contains(partial, []byte(`"cost_partial":true`)) {
 		t.Fatalf("cost_partial field: %s", partial)
 	}

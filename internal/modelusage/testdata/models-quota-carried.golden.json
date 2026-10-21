@@ -1,0 +1,67 @@
+{
+  "range": "total",
+  "bucket_seconds": 600,
+  "window_minutes": 10140,
+  "since": "2025-02-19T21:20:00Z",
+  "timezone": "UTC",
+  "generated_at": "2025-02-26T22:20:00Z",
+  "models": [
+    {
+      "provider": "claude",
+      "model": "claude-opus-5-5",
+      "subagent": false,
+      "requests": 1,
+      "failed": 0,
+      "input_tokens": 299750000,
+      "output_tokens": 0,
+      "cached_tokens": 0,
+      "reasoning_tokens": 0,
+      "total_tokens": 299750000,
+      "cache_write_tokens": 0,
+      "cost_usd_micros": 1199000000,
+      "unpriced_requests": 0,
+      "quota_weekly_pct": 59.99999999999999
+    },
+    {
+      "provider": "claude",
+      "model": "claude-haiku-5-5",
+      "subagent": false,
+      "requests": 1,
+      "failed": 0,
+      "input_tokens": 100000,
+      "output_tokens": 0,
+      "cached_tokens": 0,
+      "reasoning_tokens": 0,
+      "total_tokens": 100000,
+      "cache_write_tokens": 0,
+      "cost_usd_micros": 10000,
+      "unpriced_requests": 0,
+      "quota_weekly_pct": 0.000500417014178482
+    }
+  ],
+  "quota": {
+    "provider": "claude",
+    "accounts": 1,
+    "pooling": "mean",
+    "weekly_all": {
+      "method": "carried",
+      "used_pct": 1,
+      "cost_usd_micros": 19983333,
+      "pct_per_usd": 0.0500417014178482,
+      "accounts_in_rate": 1,
+      "accounts": [
+        {
+          "auth_index": "ia",
+          "used_pct": 1,
+          "window_start": "2025-02-26T21:20:00Z",
+          "resets_at": "2025-03-05T21:20:00Z",
+          "fit_pct_per_usd": 0.05004170141784821,
+          "fitted_at": "2025-02-19T21:20:00Z",
+          "exact": false
+        }
+      ]
+    },
+    "observed_at": "2025-02-26T22:20:00Z",
+    "stale": false
+  }
+}
