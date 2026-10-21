@@ -33,7 +33,7 @@ func TestModelUsagePricesClaudeRowsAgainstPooledQuota(t *testing.T) {
 		headers := unifiedHeaders(q.clock.Now(), "0.10", used, "0.20", "allowed")
 		modelusage.Default().HandleUsage(context.Background(), coreusage.Record{
 			Provider: "claude", Model: model, AuthIndex: index, ResponseHeaders: headers,
-			Detail: coreusage.Detail{InputTokens: 1000, OutputTokens: 100, TotalTokens: 1100},
+			Detail: coreusage.Detail{InputTokens: 10_000_000, OutputTokens: 100, TotalTokens: 10_000_100},
 		})
 		q.respond("healthy", "claude-sonnet-5-5", headers)
 	}
@@ -64,12 +64,12 @@ func TestModelUsagePricesClaudeRowsAgainstPooledQuota(t *testing.T) {
 	}
 	found, rowFound := false, false
 	for _, a := range body.Quota.WeeklyAll.Accounts {
-		found = found || (a.AuthIndex == index && a.CostUSDMicros >= 3000)
+		found = found || (a.AuthIndex == index && a.CostUSDMicros >= 20_001_000)
 	}
 	for _, row := range body.Models {
 		rowFound = rowFound || row.Model == model
-		if row.Model == model && (row.CostUSDMicros != 6000 || row.QuotaWeeklyPct == nil) {
-			t.Fatalf("row %+v: want 6000 µUSD with quota_weekly_pct", row)
+		if row.Model == model && (row.CostUSDMicros != 40_002_000 || row.QuotaWeeklyPct == nil) {
+			t.Fatalf("row %+v: want 40002000 µUSD ($40) with quota_weekly_pct", row)
 		}
 	}
 	if !found || !rowFound {

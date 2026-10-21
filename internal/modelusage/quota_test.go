@@ -4,6 +4,7 @@ import (
 	"context"
 	"math"
 	"path/filepath"
+	"reflect"
 	"testing"
 	"time"
 
@@ -20,14 +21,14 @@ func quotaFixture(t *testing.T, previousWeek bool) (*Aggregator, *fakeClock, cla
 	agg := New(clock.Now, 0)
 	ctx := context.Background()
 	if previousWeek { // ia, before its window started
-		agg.HandleUsage(ctx, claudeRecord("claude-opus-5-5", "ia", 1000, 0, 0, 0)) // 4000 µUSD
+		agg.HandleUsage(ctx, claudeRecord("claude-opus-5-5", "ia", 10_000_000, 0, 0, 0)) // $40
 	}
 	clock.Advance(day)
-	agg.HandleUsage(ctx, claudeRecord("claude-sonnet-5-5", "ib", 1000, 0, 0, 0)) // 2000
+	agg.HandleUsage(ctx, claudeRecord("claude-sonnet-5-5", "ib", 30_000_000, 0, 0, 0)) // $60
 	clock.Advance(4*day + 12*time.Hour)
-	agg.HandleUsage(ctx, claudeRecord("claude-opus-5-5", "ia", 2000, 0, 0, 0))  // 8000
-	agg.HandleUsage(ctx, claudeRecord("claude-fable-5-1", "ia", 1000, 0, 0, 0)) // 10000
-	agg.HandleUsage(ctx, claudeRecord("claude-haiku-5-5", "ib", 1000, 0, 0, 0)) // 100
+	agg.HandleUsage(ctx, claudeRecord("claude-opus-5-5", "ia", 20_000_000, 0, 0, 0))  // $80
+	agg.HandleUsage(ctx, claudeRecord("claude-fable-5-1", "ia", 10_000_000, 0, 0, 0)) // $100
+	agg.HandleUsage(ctx, claudeRecord("claude-haiku-5-5", "ib", 100_000, 0, 0, 0))    // $0.01
 	agg.HandleUsage(ctx, record("codex", "gpt-5", 10, 10))
 	clock.Advance(12 * time.Hour)
 	end := clock.Now()
@@ -75,7 +76,7 @@ func TestRowWeeklyPctOverEachAccountsWindowSumsToPooledPct(t *testing.T) {
 		t.Fatalf("sum of quota_fable_pct %v, want pooled Fable 10", fable)
 	}
 	q := snap.Quota
-	if q.WeeklyAll.CostUSDMicros != 20_100 || !near(q.WeeklyAll.PctPerUSD, 63.5/0.0201) || q.WeeklyAll.UsedPct != 63.5 {
+	if q.WeeklyAll.CostUSDMicros != 240_010_000 || !near(q.WeeklyAll.PctPerUSD, 63.5/240.01) || q.WeeklyAll.UsedPct != 63.5 {
 		t.Fatalf("weekly_all %+v", q.WeeklyAll)
 	}
 	if got := q.Fable.Models; len(got) != 1 || got[0] != "claude-fable-5-1" {
@@ -88,10 +89,10 @@ func TestPreviousWeekSpendStaysOutOfTheAccountsWindow(t *testing.T) {
 	q := agg.SnapshotWithQuota(Range7d, &pool).Quota
 	end := clock.Now()
 	want := []QuotaAccount{
-		{AuthIndex: "ia", UsedPct: 27, WindowStart: end.Add(-day), ResetsAt: end.Add(6 * day), CostUSDMicros: 18_000, BaselineAt: end.Add(-day), Exact: true},
-		{AuthIndex: "ib", UsedPct: 100, WindowStart: end.Add(-6 * day), ResetsAt: end.Add(day), CostUSDMicros: 2100, BaselineAt: end.Add(-6 * day), Exact: true},
+		{AuthIndex: "ia", UsedPct: 27, WindowStart: end.Add(-day), ResetsAt: end.Add(6 * day), CostUSDMicros: ptr[int64](180_000_000), BaselineAt: ptr(end.Add(-day)), BaselineUsedPct: ptr(0.0), Exact: true},
+		{AuthIndex: "ib", UsedPct: 100, WindowStart: end.Add(-6 * day), ResetsAt: end.Add(day), CostUSDMicros: ptr[int64](60_010_000), BaselineAt: ptr(end.Add(-6 * day)), BaselineUsedPct: ptr(0.0), Exact: true},
 	}
-	if q.WeeklyAll.CostUSDMicros != 20_100 || len(q.WeeklyAll.Accounts) != 2 || q.WeeklyAll.Accounts[0] != want[0] || q.WeeklyAll.Accounts[1] != want[1] {
+	if q.WeeklyAll.CostUSDMicros != 240_010_000 || !reflect.DeepEqual(q.WeeklyAll.Accounts, want) {
 		t.Fatalf("weekly_all %+v, want accounts %+v", q.WeeklyAll, want)
 	}
 }
@@ -102,8 +103,8 @@ func TestAccountWithoutCostInItsWindowIsLeftOut(t *testing.T) {
 	agg, _, pool := quotaFixture(t, false)
 	pool.WeeklyAll.Windows[1].AuthIndex = "no-traffic"
 	q := agg.SnapshotWithQuota(Range7d, &pool).Quota
-	if len(q.WeeklyAll.Accounts) != 1 || q.WeeklyAll.CostUSDMicros != 18_000 || !near(q.WeeklyAll.PctPerUSD, 27.0/2/0.018) {
-		t.Fatalf("weekly_all %+v, want ia alone at 13.5%% / $0.018", q.WeeklyAll)
+	if len(q.WeeklyAll.Accounts) != 1 || q.WeeklyAll.CostUSDMicros != 180_000_000 || !near(q.WeeklyAll.PctPerUSD, 27.0/2/180) {
+		t.Fatalf("weekly_all %+v, want ia alone at 13.5%% / $180", q.WeeklyAll)
 	}
 }
 
@@ -117,8 +118,9 @@ func TestQuotaOmission(t *testing.T) {
 		"no account data": {pool: &claudequota.Pool{}},
 		"no running window": {pool: &claudequota.Pool{Accounts: 2, ObservedAt: pool.ObservedAt,
 			WeeklyAll: claudequota.Pooled{UsedPct: 10, Pooled: 2}}, block: true},
-		"no cost in any window": {pool: &claudequota.Pool{Accounts: 1, ObservedAt: pool.ObservedAt,
-			WeeklyAll: claudequota.Pooled{UsedPct: 10, Pooled: 1, Windows: []claudequota.AccountWindow{{AuthIndex: "other", UsedPct: 10, ResetsAt: pool.WeeklyAll.Windows[0].ResetsAt}}}}, block: true},
+		// No account has cost in its window, yet claude rows do: the rough rate.
+		"no account cost": {pool: &claudequota.Pool{Accounts: 1, ObservedAt: pool.ObservedAt,
+			WeeklyAll: claudequota.Pooled{UsedPct: 10, Pooled: 1, Windows: []claudequota.AccountWindow{{AuthIndex: "other", UsedPct: 10, ResetsAt: pool.WeeklyAll.Windows[0].ResetsAt}}}}, block: true, weekly: true},
 		"no Fable scope": {pool: &claudequota.Pool{Accounts: 2, ObservedAt: pool.ObservedAt, WeeklyAll: pool.WeeklyAll}, block: true, weekly: true},
 	} {
 		snap := agg.SnapshotWithQuota(Range7d, tc.pool)
@@ -152,3 +154,5 @@ func TestAccountCostSurvivesRestart(t *testing.T) {
 		t.Fatalf("after restart weekly %+v fable %+v, want weekly %+v fable %+v", got.WeeklyAll, got.Fable, want.WeeklyAll, want.Fable)
 	}
 }
+
+func ptr[T any](v T) *T { return &v }
