@@ -24,10 +24,12 @@ type Quota struct {
 	Stale      bool         `json:"stale"`
 }
 
-// Rate methods: measured pairs each account's utilization change with its own cost; rough spreads the pooled
-// percent over all claude cost since the earliest running window start, before a measured rate qualifies.
+// Rate methods, in order of preference: measured pairs each account's utilization change with its own cost;
+// carried converts each account's used percent to dollars with its best past fit; rough spreads the pooled
+// percent over all claude cost since the earliest running window start.
 const (
 	MethodMeasured = "measured"
+	MethodCarried  = "carried"
 	MethodRough    = "rough"
 )
 
@@ -38,10 +40,11 @@ type QuotaWindow struct {
 	WindowStart *time.Time `json:"window_start,omitempty"`
 	// UsedPct is the pooled mean.
 	UsedPct float64 `json:"used_pct"`
-	// CostUSDMicros is the measured accounts' cost since their baselines, or rough: all claude cost since WindowStart.
+	// CostUSDMicros is measured: the accounts' cost since their baselines; carried: their used percent in dollars
+	// at their fits; rough: all claude cost since WindowStart.
 	CostUSDMicros int64 `json:"cost_usd_micros"`
 	// PctPerUSD is measured: the listed accounts' utilization change summed, over all pooled accounts, per USD of
-	// their cost; rough: UsedPct per USD of CostUSDMicros.
+	// their cost; carried: their used percent summed, over all pooled accounts, per USD; rough: UsedPct per USD.
 	PctPerUSD float64 `json:"pct_per_usd"`
 	// AccountsInRate counts the listed accounts.
 	AccountsInRate int            `json:"accounts_in_rate"`
@@ -50,7 +53,7 @@ type QuotaWindow struct {
 	Models []string `json:"models,omitempty"`
 }
 
-// QuotaAccount is one account in the rate; the cost and baseline fields are measured only.
+// QuotaAccount is one account in the rate; cost and baseline fields are measured only, fit fields carried only.
 type QuotaAccount struct {
 	AuthIndex   string    `json:"auth_index"`
 	UsedPct     float64   `json:"used_pct"`
@@ -60,6 +63,8 @@ type QuotaAccount struct {
 	CostUSDMicros   *int64     `json:"cost_usd_micros,omitempty"`
 	BaselineAt      *time.Time `json:"baseline_at,omitempty"`
 	BaselineUsedPct *float64   `json:"baseline_used_pct,omitempty"`
+	FitPctPerUSD    *float64   `json:"fit_pct_per_usd,omitempty"`
+	FittedAt        *time.Time `json:"fitted_at,omitempty"`
 	// Exact: the baseline is the window start, so the whole window's utilization pairs with its cost.
 	Exact bool `json:"exact"`
 }
@@ -81,11 +86,31 @@ const minDeltaPct = 5
 // live implied quotas are ~$1,860 (rough) and ~$5,000 (measured). A faster rate is a denominator of cents.
 const maxPctPerUsd = 2.0
 
-// account is one credential's cost: 7 days of buckets, the cumulative total since costSince, and the
-// baseline its quota window is rated from.
+// account is one credential's cost: 7 days of buckets, the cumulative total since costSince, the baseline its
+// quota window is rated from, and its best fit across windows.
 type account struct {
 	series
-	base *baseline
+	base    *baseline
+	bestFit *fit
+}
+
+// fit is one qualifying measured rate of an account; the one with the largest DeltaCostMicros is the best
+// conditioned and outlives its window.
+type fit struct {
+	PctPerUSD       float64   `json:"pct_per_usd"`
+	DeltaUsed       float64   `json:"delta_used"`
+	DeltaCostMicros int64     `json:"delta_cost_micros"`
+	FittedAt        time.Time `json:"fitted_at"`
+	WindowStart     time.Time `json:"window_start"`
+}
+
+// fitRate is an account's own rate when the change clears minDeltaPct and maxPctPerUsd.
+func fitRate(deltaUsed float64, deltaCost int64) (float64, bool) {
+	if deltaCost <= 0 || deltaUsed < minDeltaPct {
+		return 0, false
+	}
+	rate := deltaUsed / (float64(deltaCost) / 1e6)
+	return rate, rate <= maxPctPerUsd
 }
 
 // baseline pairs one utilization reading with the account's cumulative cost at that moment.
@@ -157,14 +182,23 @@ func (a *Aggregator) observeQuotaLocked(authIndex string, reading *claudequota.U
 			return
 		}
 		acc := a.accountLocked(key)
-		if acc.base.sameWindow(*limit.ResetsAt) {
+		win := claudequota.AccountWindow{ResetsAt: *limit.ResetsAt}
+		if !acc.base.sameWindow(win.ResetsAt) {
+			start := win.ResetsAt.Add(-quotaWindow)
+			acc.base = nil
+			if a.costSince.After(start) {
+				acc.base = &baseline{WindowStart: start, ResetsAt: win.ResetsAt, UsedPct: limit.Percent,
+					CostUSDMicros: acc.total.CostUSDMicros, At: limit.ObservedAt}
+			}
+		}
+		// Only measured fits are kept: a rough rate never reaches the record path.
+		b, ok := a.baselineFor(acc, win, currentID)
+		if !ok {
 			return
 		}
-		start := limit.ResetsAt.Add(-quotaWindow)
-		acc.base = nil
-		if a.costSince.After(start) {
-			acc.base = &baseline{WindowStart: start, ResetsAt: *limit.ResetsAt, UsedPct: limit.Percent,
-				CostUSDMicros: acc.total.CostUSDMicros, At: limit.ObservedAt}
+		deltaUsed, deltaCost := limit.Percent-b.UsedPct, acc.total.CostUSDMicros-b.CostUSDMicros
+		if rate, qualifies := fitRate(deltaUsed, deltaCost); qualifies && (acc.bestFit == nil || deltaCost > acc.bestFit.DeltaCostMicros) {
+			acc.bestFit = &fit{PctPerUSD: rate, DeltaUsed: deltaUsed, DeltaCostMicros: deltaCost, FittedAt: utcSecond(limit.ObservedAt), WindowStart: b.WindowStart}
 		}
 	}
 	observe(accountKey{AuthIndex: authIndex}, reading.WeeklyAll)
@@ -194,9 +228,15 @@ func (a *Aggregator) quotaLocked(pool *claudequota.Pool, currentID int64, rows [
 	q := &Quota{Provider: quotaProvider, Accounts: pool.Accounts, Pooling: claudequota.AveragingMean, ObservedAt: utcSecond(pool.ObservedAt), Stale: pool.Stale}
 	q.WeeklyAll = a.windowLocked(pool.WeeklyAll, false, currentID)
 	if q.WeeklyAll == nil {
+		q.WeeklyAll = a.carriedLocked(pool.WeeklyAll, false, currentID)
+	}
+	if q.WeeklyAll == nil {
 		q.WeeklyAll = a.roughLocked(pool.WeeklyAll, false, currentID)
 	}
 	q.Fable = a.windowLocked(pool.Fable, true, currentID)
+	if q.Fable == nil {
+		q.Fable = a.carriedLocked(pool.Fable, true, currentID)
+	}
 	if q.Fable == nil {
 		q.Fable = a.roughLocked(pool.Fable, true, currentID)
 	}
@@ -236,7 +276,7 @@ func (a *Aggregator) windowLocked(pooled claudequota.Pooled, fable bool, current
 		}
 		b, ok := a.baselineFor(acc, win, currentID)
 		deltaUsed, deltaCost := win.UsedPct-b.UsedPct, acc.total.CostUSDMicros-b.CostUSDMicros
-		if !ok || deltaCost <= 0 || deltaUsed < minDeltaPct || deltaUsed/(float64(deltaCost)/1e6) > maxPctPerUsd {
+		if _, qualifies := fitRate(deltaUsed, deltaCost); !ok || !qualifies {
 			// Rows carry this account's spend too; rating it at the others' rate would inflate every row.
 			if acc.sumSince(maxTime(win.ResetsAt.Add(-quotaWindow), a.costSince), currentID).CostUSDMicros > 0 {
 				return nil
@@ -331,3 +371,42 @@ func (a *Aggregator) roughLocked(pooled claudequota.Pooled, fable bool, currentI
 }
 
 func ptrTime(t time.Time) *time.Time { return &t }
+
+// carriedLocked converts each fitted account's used percent to dollars with its best fit and pools them like a
+// measured rate; nil when an account spent in its window without any fit, since rows carry that spend.
+func (a *Aggregator) carriedLocked(pooled claudequota.Pooled, fable bool, currentID int64) *QuotaWindow {
+	if pooled.Pooled == 0 {
+		return nil
+	}
+	w := &QuotaWindow{Method: MethodCarried, UsedPct: pooled.UsedPct, Accounts: []QuotaAccount{}}
+	var used, dollars float64
+	for _, win := range pooled.Windows {
+		acc, ok := a.accounts[accountKey{AuthIndex: win.AuthIndex, Fable: fable}]
+		if !ok {
+			continue
+		}
+		best := acc.bestFit
+		if best == nil {
+			if acc.sumSince(maxTime(win.ResetsAt.Add(-quotaWindow), a.costSince), currentID).CostUSDMicros > 0 {
+				return nil
+			}
+			continue
+		}
+		used += win.UsedPct
+		dollars += win.UsedPct / best.PctPerUSD
+		w.Accounts = append(w.Accounts, QuotaAccount{
+			AuthIndex: win.AuthIndex, UsedPct: win.UsedPct, WindowStart: utcSecond(win.ResetsAt.Add(-quotaWindow)), ResetsAt: utcSecond(win.ResetsAt),
+			FitPctPerUSD: &best.PctPerUSD, FittedAt: ptrTime(best.FittedAt),
+		})
+	}
+	if dollars <= 0 {
+		return nil
+	}
+	w.AccountsInRate = len(w.Accounts)
+	w.CostUSDMicros = int64(dollars*1e6 + 0.5)
+	w.PctPerUSD = used / float64(pooled.Pooled) / dollars
+	if w.PctPerUSD > maxPctPerUsd {
+		return nil
+	}
+	return w
+}

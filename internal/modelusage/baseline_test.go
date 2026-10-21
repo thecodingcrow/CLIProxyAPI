@@ -25,7 +25,12 @@ func opus(agg *Aggregator, input int64) { // input x $4/MTok
 
 // opusRead is opus whose response carries ia's weekly reading, as the claude executor records it.
 func opusRead(agg *Aggregator, input int64, used float64, resets time.Time) {
-	record := claudeRecord("claude-opus-5-5", "ia", input, 0, 0, 0)
+	readRecord(agg, "claude-opus-5-5", input, used, resets)
+}
+
+// readRecord records input tokens of model on ia with ia's weekly reading in the response headers.
+func readRecord(agg *Aggregator, model string, input int64, used float64, resets time.Time) {
+	record := claudeRecord(model, "ia", input, 0, 0, 0)
 	record.ResponseHeaders = http.Header{
 		"Anthropic-Ratelimit-Unified-7d-Status":      {"allowed"},
 		"Anthropic-Ratelimit-Unified-7d-Utilization": {strconv.FormatFloat(used/100, 'f', -1, 64)},
@@ -154,6 +159,10 @@ func accountState(agg *Aggregator) (map[accountKey]account, bool) {
 		if acc.base != nil {
 			b := *acc.base
 			c.base = &b
+		}
+		if acc.bestFit != nil {
+			f := *acc.bestFit
+			c.bestFit = &f
 		}
 		out[k] = c
 	}

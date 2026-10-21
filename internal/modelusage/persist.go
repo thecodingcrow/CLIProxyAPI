@@ -45,6 +45,8 @@ type fileAccount struct {
 	// TotalCostUSDMicros is cumulative since cost_since; absent in older files, where the buckets hold it all.
 	TotalCostUSDMicros int64     `json:"total_cost_usd_micros,omitempty"`
 	Baseline           *baseline `json:"baseline,omitempty"`
+	// BestFit outlives windows; older files lack it.
+	BestFit *fit `json:"best_fit,omitempty"`
 }
 
 type fileSeries struct {
@@ -126,6 +128,9 @@ func (a *Aggregator) Open(path string) {
 		if fa.Baseline != nil {
 			acc.base = fa.Baseline
 		}
+		if fa.BestFit != nil && (acc.bestFit == nil || fa.BestFit.DeltaCostMicros > acc.bestFit.DeltaCostMicros) {
+			acc.bestFit = fa.BestFit
+		}
 	}
 	if state.Priced && !trackedSince.IsZero() && trackedSince.Before(a.costSince) {
 		a.costSince = trackedSince
@@ -157,13 +162,13 @@ func (a *Aggregator) Flush() error {
 	for key, acc := range a.accounts {
 		acc.prune(currentID)
 		// Idle 7 days with no running window: nothing left to rate.
-		if len(acc.buckets) == 0 && (acc.base == nil || !acc.base.ResetsAt.After(a.now())) {
+		if len(acc.buckets) == 0 && acc.bestFit == nil && (acc.base == nil || !acc.base.ResetsAt.After(a.now())) {
 			delete(a.accounts, key)
 			continue
 		}
 		state.Accounts = append(state.Accounts, fileAccount{
 			AuthIndex: key.AuthIndex, Fable: key.Fable, LastID: acc.lastID, Buckets: acc.buckets,
-			TotalCostUSDMicros: acc.total.CostUSDMicros, Baseline: acc.base,
+			TotalCostUSDMicros: acc.total.CostUSDMicros, Baseline: acc.base, BestFit: acc.bestFit,
 		})
 	}
 	data, errMarshal := json.Marshal(state)
