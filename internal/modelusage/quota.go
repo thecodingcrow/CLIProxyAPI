@@ -74,7 +74,7 @@ func inFableScope(model string) bool {
 	return claudequota.ScopeMatchesModel(claudequota.ScopeFable, model)
 }
 
-// minDeltaPct is the smallest utilization change an inexact baseline rates: readings move in ~1-point steps.
+// minDeltaPct is the smallest utilization change any rate uses: readings move in ~1-point steps, over cents right after a rollover.
 const minDeltaPct = 5
 
 // account is one credential's cost: 7 days of buckets, the cumulative total since costSince, and the
@@ -232,7 +232,7 @@ func (a *Aggregator) windowLocked(pooled claudequota.Pooled, fable bool, current
 		}
 		b, ok := a.baselineFor(acc, win, currentID)
 		deltaUsed, deltaCost := win.UsedPct-b.UsedPct, acc.total.CostUSDMicros-b.CostUSDMicros
-		if !ok || deltaCost <= 0 || (!b.Exact && deltaUsed < minDeltaPct) {
+		if !ok || deltaCost <= 0 || deltaUsed < minDeltaPct {
 			// Rows carry this account's spend too; rating it at the others' rate would inflate every row.
 			if acc.sumSince(maxTime(win.ResetsAt.Add(-quotaWindow), a.costSince), currentID).CostUSDMicros > 0 {
 				return nil
@@ -291,9 +291,9 @@ func (a *Aggregator) fableModelsLocked() []string {
 }
 
 // roughLocked spreads the pooled percent over all claude cost (every account, backfilled history too) since the
-// earliest running window start; nil without a running window, utilization or cost.
+// earliest running window start; nil without a running window, minDeltaPct of utilization or cost.
 func (a *Aggregator) roughLocked(pooled claudequota.Pooled, fable bool, currentID int64) *QuotaWindow {
-	if len(pooled.Windows) == 0 || pooled.UsedPct <= 0 {
+	if len(pooled.Windows) == 0 || pooled.UsedPct < minDeltaPct {
 		return nil
 	}
 	w := &QuotaWindow{Method: MethodRough, UsedPct: pooled.UsedPct, AccountsInRate: len(pooled.Windows), Accounts: []QuotaAccount{}}

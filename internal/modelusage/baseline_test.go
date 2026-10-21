@@ -68,8 +68,8 @@ func TestWindowStartedAfterTrackingIsExact(t *testing.T) {
 	clock.Advance(2 * day)
 	opus(agg, 250_000)
 	resets := clock.Now().Add(6 * day) // window started a day ago
-	w := agg.SnapshotWithQuota(Range7d, onePool(3, resets, clock.Now())).Quota.WeeklyAll
-	if w == nil || w.CostUSDMicros != 1_000_000 || !near(w.PctPerUSD, 3.0/2/1.0) || !w.Accounts[0].Exact || *w.Accounts[0].BaselineUsedPct != 0 {
+	w := agg.SnapshotWithQuota(Range7d, onePool(6, resets, clock.Now())).Quota.WeeklyAll
+	if w == nil || w.CostUSDMicros != 1_000_000 || !near(w.PctPerUSD, 6.0/2/1.0) || !w.Accounts[0].Exact || *w.Accounts[0].BaselineUsedPct != 0 {
 		t.Fatalf("exact window: %+v", w)
 	}
 	if !w.Accounts[0].BaselineAt.Equal(resets.Add(-7 * day)) {
@@ -85,8 +85,8 @@ func TestWindowRolloverRestartsTheBaselineAtTheNewWindowStart(t *testing.T) {
 	clock.Advance(2 * day) // past the reset
 	next := resets.Add(7 * day)
 	opusRead(agg, 250_000, 2, next)
-	w := agg.SnapshotWithQuota(Range7d, onePool(2, next, clock.Now())).Quota.WeeklyAll
-	if w == nil || w.CostUSDMicros != 1_000_000 || !w.Accounts[0].Exact || !near(w.PctPerUSD, 2.0/2/1.0) {
+	w := agg.SnapshotWithQuota(Range7d, onePool(5, next, clock.Now())).Quota.WeeklyAll
+	if w == nil || w.CostUSDMicros != 1_000_000 || !w.Accounts[0].Exact || !near(w.PctPerUSD, 5.0/2/1.0) {
 		t.Fatalf("after rollover: %+v, want exact from the new window start", w)
 	}
 }
@@ -112,7 +112,7 @@ func TestBaselinesAndTrackingStartSurviveRestart(t *testing.T) {
 	// A window started after tracking began but before the restart: exact only if the tracking start persisted.
 	exactStart := clock.Now().Add(-day)
 	opus(after, 250_000)
-	if w := after.SnapshotWithQuota(Range7d, onePool(1, exactStart.Add(7*day), clock.Now())).Quota.WeeklyAll; w == nil || !w.Accounts[0].Exact || w.CostUSDMicros != 1_000_000 {
+	if w := after.SnapshotWithQuota(Range7d, onePool(5, exactStart.Add(7*day), clock.Now())).Quota.WeeklyAll; w == nil || !w.Accounts[0].Exact || w.CostUSDMicros != 1_000_000 {
 		t.Fatalf("tracking start lost on restart: %+v, want an exact baseline", w)
 	}
 }
@@ -139,7 +139,7 @@ func TestPricedFileWithoutTrackingStartTracksFromOldestBucket(t *testing.T) {
 		t.Fatalf("window before tracking: %+v, want inexact, $1 since the first reading", w)
 	}
 	after := clock.Now().Add(-12*time.Hour + 7*day) // started after the oldest bucket
-	if w := agg.SnapshotWithQuota(Range7d, onePool(1, after, clock.Now())).Quota.WeeklyAll; w == nil || !w.Accounts[0].Exact || w.CostUSDMicros != 1_400_000 {
+	if w := agg.SnapshotWithQuota(Range7d, onePool(5, after, clock.Now())).Quota.WeeklyAll; w == nil || !w.Accounts[0].Exact || w.CostUSDMicros != 1_400_000 {
 		t.Fatalf("window after tracking start: %+v, want exact", w)
 	}
 }
